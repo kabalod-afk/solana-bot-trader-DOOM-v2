@@ -2,7 +2,7 @@
   "version": "2.1.0-helios",
   "learned_weights": {
     "min_observation_window_ms": 10000,
-    "min_pool_sol_threshold": 5.0,
+    "min_pool_sol_threshold": 15.0,
     "ideal_buy_ratio": 0.60,
     "derisk_sensitivity": 0.30
   },

@@ -13,6 +13,7 @@ import { TradeEngine } from './strategy/TradeEngine';
 import { NewPoolEvent, PoolListener } from './blockchain/PoolListener';
 import { fetchRealPoolTick } from './blockchain/poolTick';
 import { loadWalletA } from './core/loadWalletA';
+import { loadMomentumConfig } from './core/momentumConfig';
 
 function requireEnv(key: string): string {
   const value = process.env[key];
@@ -80,7 +81,6 @@ async function bootstrap(): Promise<void> {
   const activeEnginesList: ActivePosition[] = [];
   let opCounter = 1;
   let solPriceUSD = 160;
-  let lastRejectTelegramMs = 0;
 
   const refreshSolPrice = async () => {
     try {
@@ -122,9 +122,13 @@ async function bootstrap(): Promise<void> {
     activeEnginesList.length = 0;
   });
 
+  const momentum = loadMomentumConfig(helios.brain.learned_weights.min_pool_sol_threshold);
   console.log(`✅ Cartera A: ${walletA.publicKey.toBase58()}`);
   console.log(
     `Helios ${helios.brain.version} | LIVE_TRADING=${liveTrading} | SOL≈$${solPriceUSD}`
+  );
+  console.log(
+    `Momentum: pool≥${momentum.minPoolSol} SOL | MC $${momentum.minMcUSD}-$${momentum.maxMcUSD} | minTx=${momentum.minTxCount}`
   );
   if (!liveTrading) {
     console.log('🧪 DRY-RUN: Helius → B0 (LP burn + sim) → ventana 0-45s; sin compras.');
@@ -165,19 +169,9 @@ async function bootstrap(): Promise<void> {
       );
 
       if (!b0Result.passed) {
+        // Rechazos solo en consola/PM2 — sin spam Telegram
         console.log(`[B0_REJECT] ${token}: ${b0Result.reason}`);
-        const now = Date.now();
-        const isFakeMc =
-          (b0Result.reason ?? '').includes('Inflado') || b0Result.initialMcUSD > 100_000;
-        if (isFakeMc || now - lastRejectTelegramMs > 4000) {
-          lastRejectTelegramMs = now;
-          await telegram.sendText(
-            `🤖 *BLOQUE 0 RECHAZO*\n• Token: \`${token}\`\n• Fuente: ${event.source}\n• Motivo: ${b0Result.reason}` +
-              (b0Result.initialMcUSD > 0
-                ? `\n• MC: $${b0Result.initialMcUSD.toFixed(0)} | Pool: ${b0Result.initialPoolSol.toFixed(2)} SOL`
-                : '')
-          );
-        }
+        void telegram.notifyBlockZeroReject(token, b0Result.reason ?? '');
         return;
       }
 
@@ -186,7 +180,7 @@ async function bootstrap(): Promise<void> {
       const botInstanceId = scheduler.registerThread();
       activeTokensSet.add(token);
 
-      telegram.notifyAnalysis(
+      telegram.notifyAnalysisPassed(
         botInstanceId,
         token,
         b0Result.initialMcUSD,
@@ -200,9 +194,7 @@ async function bootstrap(): Promise<void> {
       );
 
       if (!obsResult.passed) {
-        await telegram.sendText(
-          `🤖 *[${botInstanceId}] RECHAZADO EN VENTANA 0-45s:* ${obsResult.reason}`
-        );
+        console.log(`[WINDOW_REJECT] ${token}: ${obsResult.reason}`);
         activeTokensSet.delete(token);
         scheduler.releaseThread();
         return;
@@ -210,8 +202,8 @@ async function bootstrap(): Promise<void> {
 
       const balanceLamports = await connection.getBalance(walletA.publicKey);
       if (balanceLamports / 1e9 < obsResult.entrySizeSol + 0.05) {
-        await telegram.sendText(
-          `🤖 *[${botInstanceId}] CAPITAL INSUFICIENTE:* ${obsResult.entrySizeSol} SOL + 0.05 gas.`
+        console.log(
+          `[CAPITAL] ${botInstanceId}: insuficiente para ${obsResult.entrySizeSol} SOL + gas`
         );
         activeTokensSet.delete(token);
         scheduler.releaseThread();

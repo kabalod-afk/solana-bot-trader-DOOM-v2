@@ -1,5 +1,6 @@
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { HeliosEngine } from '../core/HeliosEngine';
+import { loadMomentumConfig } from '../core/momentumConfig';
 
 export interface BlockZeroResult {
   passed: boolean;
@@ -58,14 +59,17 @@ export class BlockZeroScanner {
       };
     }
 
-    const minPoolRequired = this.helios.brain.learned_weights.min_pool_sol_threshold;
+    const momentum = loadMomentumConfig(
+      this.helios.brain.learned_weights.min_pool_sol_threshold
+    );
+    const minPoolRequired = momentum.minPoolSol;
 
     // --- SHORT-CIRCUIT: solo balance SOL/WSOL antes de RPC/HTTP pesado ---
     const quickSol = await this.quickSolLiquidityCheck(pool, opts);
     if (quickSol < minPoolRequired) {
       return {
         passed: false,
-        reason: `Pool insuficiente (${quickSol.toFixed(2)} SOL < min Helios ${minPoolRequired} SOL)`,
+        reason: `Pool insuficiente (${quickSol.toFixed(2)} SOL < min ${minPoolRequired} SOL)`,
         initialMcUSD: 0,
         initialPoolSol: quickSol,
       };
@@ -87,7 +91,7 @@ export class BlockZeroScanner {
     if (poolMetrics.solAmount < minPoolRequired) {
       return {
         passed: false,
-        reason: `Pool insuficiente (${poolMetrics.solAmount.toFixed(2)} SOL < min Helios ${minPoolRequired} SOL)`,
+        reason: `Pool insuficiente (${poolMetrics.solAmount.toFixed(2)} SOL < min ${minPoolRequired} SOL)`,
         initialMcUSD: 0,
         initialPoolSol: poolMetrics.solAmount,
       };
@@ -107,10 +111,15 @@ export class BlockZeroScanner {
       ((poolMetrics.solAmount * solPriceUSD) / poolMetrics.tokenAmount) *
       poolMetrics.totalSupply;
 
-    if (initialMcUSD > 100_000) {
+    // Momentum: fuera de rango → consola/PM2 únicamente (sin Telegram)
+    if (
+      poolMetrics.solAmount < minPoolRequired ||
+      initialMcUSD < momentum.minMcUSD ||
+      initialMcUSD > momentum.maxMcUSD
+    ) {
       return {
         passed: false,
-        reason: `MC Inicial Inflado ($${initialMcUSD.toFixed(0)} > $100k)`,
+        reason: `Fuera de rango de momentum (${poolMetrics.solAmount.toFixed(2)} SOL, $${initialMcUSD.toFixed(0)} MC; rango $${momentum.minMcUSD}-$${momentum.maxMcUSD}, pool≥${minPoolRequired})`,
         initialMcUSD,
         initialPoolSol: poolMetrics.solAmount,
       };

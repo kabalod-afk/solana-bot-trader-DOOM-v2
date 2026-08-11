@@ -1,5 +1,6 @@
 import { Connection, PublicKey, LogsCallback } from '@solana/web3.js';
 import { HeliosEngine } from '../core/HeliosEngine';
+import { loadMomentumConfig } from '../core/momentumConfig';
 
 export interface ObservationResult {
   passed: boolean;
@@ -31,6 +32,9 @@ export class WindowObserver {
     const startTime = Date.now();
     const MAX_WINDOW_MS = 45_000;
     const minWindowMs = this.helios.brain.learned_weights.min_observation_window_ms;
+    const { minTxCount } = loadMomentumConfig(
+      this.helios.brain.learned_weights.min_pool_sol_threshold
+    );
 
     let thirdPartySells = 0;
     let totalBuys = 0;
@@ -89,7 +93,8 @@ export class WindowObserver {
           elapsedTime >= minWindowMs &&
           thirdPartySells >= 1 &&
           buyRatio >= minRatio &&
-          isLpSecured
+          isLpSecured &&
+          totalTx >= minTxCount
         ) {
           const isHighConviction = buyRatio >= 0.8 && initialPoolSol >= 15.0;
           const entrySizeSol = isHighConviction ? 1.5 : 1.0;

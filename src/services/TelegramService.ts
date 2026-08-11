@@ -85,6 +85,24 @@ export class TelegramService {
     }
   }
 
+  /**
+   * Silenciado: rechazos B0 no van a Telegram (solo consola/PM2).
+   * Conservamos alertas de análisis aprobado, compra y venta/PnL.
+   */
+  public async notifyBlockZeroReject(_token: string, _reason: string): Promise<void> {
+    return;
+  }
+
+  /** Alias: token superó B0 y entra a ventana dinámica. */
+  notifyAnalysisPassed(
+    botId: string,
+    token: string,
+    mcUSD: number,
+    poolSol: number
+  ): void {
+    this.notifyAnalysis(botId, token, mcUSD, poolSol);
+  }
+
   notifyAnalysis(botId: string, token: string, mcUSD: number, poolSol: number): void {
     void this.sendText(
       `🤖 *[${botId}]* 🔍 *ANALIZANDO TOKEN*\n• Token: \`${token}\`\n• MC Inicial: $${mcUSD.toFixed(0)} USD\n• Pool: ${poolSol} SOL\n⏱ En ventana dinámica 0-45s...`
