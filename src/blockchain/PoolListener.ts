@@ -24,10 +24,16 @@ export interface NewPoolEvent {
   coinVault?: string;
   /** Raydium pool pc vault (WSOL) */
   pcVault?: string;
+  /** Pump.fun associated bonding curve (token vault ATA) */
+  associatedBondingCurve?: string;
   signature: string;
   timestamp: number;
   source: 'raydium' | 'pump';
 }
+
+/** Pump.fee / protocol accounts that must never be treated as mint/pool */
+const PUMP_FEE_RECIPIENT = '4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf';
+
 
 type LogsNotification = {
   params?: {
@@ -82,16 +88,32 @@ export function parseRaydiumInitialize2(
   };
 }
 
+/**
+ * Pump.fun `create`:
+ * 0 = mint, 2 = bonding_curve, 3 = associated_bonding_curve, 7 = user
+ */
 export function parsePumpFunCreate(
   ixAccounts: PublicKey[],
   signature: string
 ): NewPoolEvent | null {
   if (ixAccounts.length < 8) return null;
 
+  const tokenAddress = ixAccounts[0].toBase58();
+  const poolAddress = ixAccounts[2].toBase58();
+  const associatedBondingCurve = ixAccounts[3]?.toBase58();
+  const deployerAddress = ixAccounts[7].toBase58();
+
+  // Rechazar extracciones basura (fee account, WSOL, etc.)
+  if (tokenAddress === WSOL_MINT || poolAddress === WSOL_MINT) return null;
+  if (tokenAddress === PUMP_FEE_RECIPIENT || poolAddress === PUMP_FEE_RECIPIENT) return null;
+  if (tokenAddress === poolAddress) return null;
+  if (tokenAddress === deployerAddress) return null;
+
   return {
-    tokenAddress: ixAccounts[0].toBase58(),
-    poolAddress: ixAccounts[2].toBase58(),
-    deployerAddress: ixAccounts[7].toBase58(),
+    tokenAddress,
+    poolAddress,
+    deployerAddress,
+    associatedBondingCurve,
     signature,
     timestamp: Date.now(),
     source: 'pump',
@@ -315,15 +337,16 @@ export class PoolListener {
       }
 
       if (programId.equals(pumpPk)) {
-        const parsed = parsePumpFunCreate(ixAccounts, signature);
-        if (parsed) return parsed;
+        // Solo instrucciones create con suficientes cuentas (evitar buy/sell/other)
+        if (ixAccounts.length >= 8) {
+          const parsed = parsePumpFunCreate(ixAccounts, signature);
+          if (parsed) return parsed;
+        }
       }
     }
 
-    if (preferred === 'raydium') {
-      return parseRaydiumInitialize2(accountKeys, signature);
-    }
-    return parsePumpFunCreate(accountKeys, signature);
+    // Sin fallback sobre accountKeys globales (desalineaba índices → WSOL/fee como "mint")
+    return null;
   }
 
   private getCompiledInstructions(

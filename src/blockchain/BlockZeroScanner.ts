@@ -13,6 +13,7 @@ export interface AuditTokenOpts {
   source?: 'raydium' | 'pump';
   coinVault?: string;
   pcVault?: string;
+  associatedBondingCurve?: string;
 }
 
 const INCINERATOR = '1nc1nerator11111111111111111111111111111111';
@@ -72,9 +73,15 @@ export class BlockZeroScanner {
 
     // Solo si supera el mínimo Helios: métricas completas + filtros + Jupiter
     const poolMetrics =
-      opts?.source === 'raydium' && opts.coinVault && opts.pcVault
-        ? await this.fetchRaydiumVaultMetrics(opts.coinVault, opts.pcVault, mint)
-        : await this.fetchPoolMetricsFallback(pool, mint);
+      opts?.source === 'pump'
+        ? await this.fetchPumpBondingMetrics(
+            pool,
+            mint,
+            opts.associatedBondingCurve
+          )
+        : opts?.source === 'raydium' && opts.coinVault && opts.pcVault
+          ? await this.fetchRaydiumVaultMetrics(opts.coinVault, opts.pcVault, mint)
+          : await this.fetchPoolMetricsFallback(pool, mint);
 
     // Revalidar SOL con lectura completa (puede diferir del quick check)
     if (poolMetrics.solAmount < minPoolRequired) {
@@ -200,6 +207,61 @@ export class BlockZeroScanner {
     // Pump / fallback: lamports nativos en bonding curve / pool
     const lamports = await this.connection.getBalance(pool).catch(() => 0);
     return lamports / 1e9;
+  }
+
+  /** Pump: SOL en bonding_curve + tokens en associated_bonding_curve. */
+  private async fetchPumpBondingMetrics(
+    bondingCurve: PublicKey,
+    mint: PublicKey,
+    associatedBondingCurve?: string
+  ) {
+    const solAmount =
+      (await this.connection.getBalance(bondingCurve).catch(() => 0)) / 1e9;
+
+    let tokenAmount = 0;
+    if (associatedBondingCurve) {
+      try {
+        const bal = await this.connection.getTokenAccountBalance(
+          new PublicKey(associatedBondingCurve)
+        );
+        tokenAmount = bal.value.uiAmount ?? 0;
+      } catch {
+        tokenAmount = 0;
+      }
+    }
+
+    // Fallback: ATA del bonding curve como owner
+    if (tokenAmount <= 0) {
+      try {
+        const atas = await this.connection.getParsedTokenAccountsByOwner(bondingCurve, {
+          mint,
+        });
+        tokenAmount =
+          atas.value[0]?.account.data.parsed?.info?.tokenAmount?.uiAmount ?? 0;
+      } catch {
+        tokenAmount = 0;
+      }
+    }
+
+    let totalSupply = 0;
+    try {
+      const supply = await this.connection.getTokenSupply(mint);
+      totalSupply = supply.value.uiAmount ?? 0;
+    } catch {
+      totalSupply = 0;
+    }
+
+    // En bonding curve, si aún no leemos ATA pero hay SOL, usar supply virtual restante
+    // (pump suele dejar ~1.073B tokens en curva al nacer) — mejor que fallar en 0
+    if (tokenAmount <= 0 && solAmount > 0 && totalSupply > 0) {
+      tokenAmount = totalSupply;
+    }
+
+    return {
+      solAmount,
+      tokenAmount,
+      totalSupply: totalSupply > 0 ? totalSupply : Math.max(tokenAmount, 1),
+    };
   }
 
   /** Lee balances reales de vaults Raydium (no del AMM id). */

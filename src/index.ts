@@ -160,6 +160,7 @@ async function bootstrap(): Promise<void> {
           source: event.source,
           coinVault: event.coinVault,
           pcVault: event.pcVault,
+          associatedBondingCurve: event.associatedBondingCurve,
         }
       );
 

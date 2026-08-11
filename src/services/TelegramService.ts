@@ -17,16 +17,18 @@ export class TelegramService {
     this.onForceCloseCallback = handler;
   }
 
-  /** Escapa caracteres problemáticos fuera de spans `code` y sin romper *bold*. */
-  private sanitizeMarkdown(text: string): string {
-    const parts = text.split(/(`[^`]*`)/g);
-    return parts
-      .map((part, i) => {
-        if (i % 2 === 1) return part;
-        // No escapar * (negrita intencional). Escapar el resto conflictivo.
-        return part.replace(/([_[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
-      })
-      .join('');
+  /**
+   * Escapa & < > y convierte *negrita* / `código` a HTML.
+   * Evita el escape agresivo de MarkdownV2 (\( \) \. etc.).
+   */
+  private toHtml(text: string): string {
+    const escaped = text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    return escaped
+      .replace(/\*([^*]+)\*/g, '<b>$1</b>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
   }
 
   private listenCommands(): void {
@@ -71,11 +73,10 @@ export class TelegramService {
 
   public async sendText(msg: string): Promise<void> {
     try {
-      await this.bot.sendMessage(this.chatId, this.sanitizeMarkdown(msg), {
-        parse_mode: 'Markdown',
+      await this.bot.sendMessage(this.chatId, this.toHtml(msg), {
+        parse_mode: 'HTML',
       });
     } catch (error) {
-      // Fallback sin Markdown si el escape falla
       try {
         await this.bot.sendMessage(this.chatId, msg.replace(/[*_`]/g, ''));
       } catch (e2) {
