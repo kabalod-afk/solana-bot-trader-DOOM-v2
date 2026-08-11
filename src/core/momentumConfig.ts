@@ -15,9 +15,9 @@ export function loadMomentumConfig(heliosMinPoolSol = 5): MomentumConfig {
   };
 
   return {
-    minMcUSD: num('MIN_MC_USD', 30_000),
+    minMcUSD: num('MIN_MC_USD', 10_000),
     maxMcUSD: num('MAX_MC_USD', 250_000),
-    minTxCount: num('MIN_TX_COUNT', 200),
+    minTxCount: num('MIN_TX_COUNT', 15),
     minPoolSol: num('MIN_POOL_SOL', heliosMinPoolSol),
   };
 }

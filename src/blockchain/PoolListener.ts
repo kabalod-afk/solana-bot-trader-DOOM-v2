@@ -175,7 +175,10 @@ export class PoolListener {
   constructor(
     private wssUrl: string,
     private connection: Connection,
-    private onNewPoolCallback: (event: NewPoolEvent) => void
+    private onNewPoolCallback: (event: NewPoolEvent) => void | Promise<void>,
+    /** false → descarta antes de getTransaction (máx. concurrencia RPC). */
+    private tryAcquireRpc?: () => boolean,
+    private releaseRpc?: () => void
   ) {}
 
   public start(): void {
@@ -244,6 +247,7 @@ export class PoolListener {
     try {
       const parsed = JSON.parse(rawMessage) as LogsNotification;
       const value = parsed.params?.result?.value;
+      // 1. Descarte instantáneo si el evento no trae info útil
       if (!value || value.err || !value.signature) return;
 
       const logs = value.logs ?? [];
@@ -265,24 +269,37 @@ export class PoolListener {
 
       if (!isRaydiumInit && !isPumpCreate) return;
 
+      // Solo marcar visto si se adquirió la ranura RPC (si no, un reintento WS puede reprocesar)
+      if (this.tryAcquireRpc && !this.tryAcquireRpc()) {
+        return;
+      }
+
       this.seenSignatures.add(signature);
       if (this.seenSignatures.size > 5_000) {
         const first = this.seenSignatures.values().next().value;
         if (first) this.seenSignatures.delete(first);
       }
 
-      const event = await this.resolvePoolFromSignature(
-        signature,
-        isRaydiumInit ? 'raydium' : 'pump'
-      );
-      if (event) {
+      // Misma ranura para getTx → B0; liberar SOLO al concluir esa cadena
+      try {
+        const event = await this.resolvePoolFromSignature(
+          signature,
+          isRaydiumInit ? 'raydium' : 'pump'
+        );
+
+        if (!event?.poolAddress || !event.tokenAddress) return;
+
         console.log(
           `[HELIUS_WS] ${event.source} token=${event.tokenAddress} pool=${event.poolAddress}`
         );
-        this.onNewPoolCallback(event);
+
+        // Await B0 (no la ventana 0-45s) — el callback debe devolver tras auditToken
+        await this.onNewPoolCallback(event);
+      } finally {
+        this.releaseRpc?.();
       }
     } catch {
-      /* heartbeats */
+      /* heartbeats / JSON basura */
     }
   }
 

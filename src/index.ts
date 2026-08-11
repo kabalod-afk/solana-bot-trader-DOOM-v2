@@ -138,21 +138,20 @@ async function bootstrap(): Promise<void> {
     `🟢 *DOOM v2 ONLINE*\n• Modo: ${liveTrading ? 'LIVE' : 'DRY-RUN'}\n• Feed: Helius WS (parser Raydium/Pump exacto)\n• Cartera A: \`${walletA.publicKey.toBase58()}\``
   );
 
-  /** Procesa un pool en paralelo sin bloquear el WS. */
-  const processPoolEvent = async (event: NewPoolEvent): Promise<void> => {
+  /**
+   * Cadena getTx→B0 (ranura ya reservada por PoolListener).
+   * Al devolver, PoolListener libera el slot; la ventana 0-45s sigue en background.
+   */
+  const processBlockZeroChain = async (event: NewPoolEvent): Promise<void> => {
     const token = event.tokenAddress;
 
+    if (!event.poolAddress || !event.tokenAddress) return;
     if (telegram.isPaused()) return;
     if (activeTokensSet.has(token) || inflightTokens.has(token)) return;
-    // 1. Control de saturación RPC: máx 5 auditorías B0 en paralelo
-    if (!scheduler.canAuditInflight()) {
-      return;
-    }
     if (!scheduler.canSpawnThread()) return;
     if (helios.isBlacklisted(event.deployerAddress)) return;
 
     inflightTokens.add(token);
-    scheduler.registerInflight();
 
     try {
       const b0Result = await scanner.auditToken(
@@ -169,13 +168,31 @@ async function bootstrap(): Promise<void> {
       );
 
       if (!b0Result.passed) {
-        // Rechazos solo en consola/PM2 — sin spam Telegram
         console.log(`[B0_REJECT] ${token}: ${b0Result.reason}`);
         void telegram.notifyBlockZeroReject(token, b0Result.reason ?? '');
+        inflightTokens.delete(token);
         return;
       }
 
-      if (!scheduler.canSpawnThread()) return;
+      // Ranura se libera al retornar (PoolListener.finally). Ventana sin ocupar slot RPC.
+      void continueAfterBlockZero(event, b0Result);
+    } catch (err) {
+      console.error(`[B0_CHAIN_ERROR] ${token}:`, err);
+      inflightTokens.delete(token);
+    }
+  };
+
+  const continueAfterBlockZero = async (
+    event: NewPoolEvent,
+    b0Result: { initialMcUSD: number; initialPoolSol: number }
+  ): Promise<void> => {
+    const token = event.tokenAddress;
+
+    try {
+      if (!scheduler.canSpawnThread()) {
+        inflightTokens.delete(token);
+        return;
+      }
 
       const botInstanceId = scheduler.registerThread();
       activeTokensSet.add(token);
@@ -310,17 +327,21 @@ async function bootstrap(): Promise<void> {
       }
     } finally {
       inflightTokens.delete(token);
-      scheduler.releaseInflight();
     }
   };
 
-  const poolListener = new PoolListener(wssUrl, connection, (event: NewPoolEvent) => {
-    // Fire-and-forget: no bloquea el WS ni a otros candidatos
-    void processPoolEvent(event);
-  });
+  const poolListener = new PoolListener(
+    wssUrl,
+    connection,
+    (event: NewPoolEvent) => processBlockZeroChain(event),
+    () => scheduler.tryAcquireInflight(),
+    () => scheduler.releaseInflight()
+  );
   poolListener.start();
 
-  console.log('📡 PoolListener activo — parser fiduciario Raydium/Pump; cola async sin mutex.');
+  console.log(
+    '📡 PoolListener activo — ranura única getTx→B0 (máx 2); ventana async tras liberar.'
+  );
 }
 
 bootstrap().catch((err) => {

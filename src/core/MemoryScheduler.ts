@@ -4,7 +4,8 @@ export class MemoryScheduler {
   private activeThreads = 0;
   private nextBotSerial = 1;
   private inflightAudits = 0;
-  private readonly MAX_INFLIGHT = 5;
+  /** Máx. resoluciones/auditorías RPC en paralelo (WS → getTx + B0). */
+  private readonly MAX_INFLIGHT = 2;
 
   public canSpawnThread(): boolean {
     const freeRamGB = os.freemem() / (1024 * 1024 * 1024);
@@ -17,6 +18,13 @@ export class MemoryScheduler {
     return this.inflightAudits < this.MAX_INFLIGHT;
   }
 
+  /** Reserva un slot RPC de forma atómica. false = descartar sin gastar RPC. */
+  public tryAcquireInflight(): boolean {
+    if (this.inflightAudits >= this.MAX_INFLIGHT) return false;
+    this.inflightAudits++;
+    return true;
+  }
+
   public registerInflight(): void {
     this.inflightAudits++;
   }
@@ -25,8 +33,18 @@ export class MemoryScheduler {
     this.inflightAudits = Math.max(0, this.inflightAudits - 1);
   }
 
-  public getInflightAudits(): number {
+  /** Alias semántico: liberar ranura RPC al cerrar cadena getTx→B0. */
+  public releaseRpcSlot(): void {
+    this.releaseInflight();
+  }
+
+  public getInflightCount(): number {
     return this.inflightAudits;
+  }
+
+  /** @deprecated usar getInflightCount */
+  public getInflightAudits(): number {
+    return this.getInflightCount();
   }
 
   public registerThread(): string {
