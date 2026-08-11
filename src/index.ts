@@ -140,7 +140,10 @@ async function bootstrap(): Promise<void> {
 
     if (telegram.isPaused()) return;
     if (activeTokensSet.has(token) || inflightTokens.has(token)) return;
-    if (!scheduler.canAuditInflight()) return;
+    // 1. Control de saturación RPC: máx 5 auditorías B0 en paralelo
+    if (!scheduler.canAuditInflight()) {
+      return;
+    }
     if (!scheduler.canSpawnThread()) return;
     if (helios.isBlacklisted(event.deployerAddress)) return;
 

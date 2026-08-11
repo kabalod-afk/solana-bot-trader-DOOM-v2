@@ -57,13 +57,26 @@ export class BlockZeroScanner {
       };
     }
 
+    const minPoolRequired = this.helios.brain.learned_weights.min_pool_sol_threshold;
+
+    // --- SHORT-CIRCUIT: solo balance SOL/WSOL antes de RPC/HTTP pesado ---
+    const quickSol = await this.quickSolLiquidityCheck(pool, opts);
+    if (quickSol < minPoolRequired) {
+      return {
+        passed: false,
+        reason: `Pool insuficiente (${quickSol.toFixed(2)} SOL < min Helios ${minPoolRequired} SOL)`,
+        initialMcUSD: 0,
+        initialPoolSol: quickSol,
+      };
+    }
+
+    // Solo si supera el mínimo Helios: métricas completas + filtros + Jupiter
     const poolMetrics =
       opts?.source === 'raydium' && opts.coinVault && opts.pcVault
         ? await this.fetchRaydiumVaultMetrics(opts.coinVault, opts.pcVault, mint)
         : await this.fetchPoolMetricsFallback(pool, mint);
 
-    const minPoolRequired = this.helios.brain.learned_weights.min_pool_sol_threshold;
-
+    // Revalidar SOL con lectura completa (puede diferir del quick check)
     if (poolMetrics.solAmount < minPoolRequired) {
       return {
         passed: false,
@@ -141,6 +154,7 @@ export class BlockZeroScanner {
       };
     }
 
+    // Jupiter chained quote solo tras pasar liquidez + seguridad on-chain
     const dryRunOk = await this.simulateChainedBuySell(tokenAddress);
     if (!dryRunOk) {
       return {
@@ -156,6 +170,36 @@ export class BlockZeroScanner {
       initialMcUSD,
       initialPoolSol: poolMetrics.solAmount,
     };
+  }
+
+  /**
+   * Lectura mínima de liquidez SOL/WSOL (1 RPC) para descartar antes de Jupiter/metadatos.
+   */
+  private async quickSolLiquidityCheck(
+    pool: PublicKey,
+    opts?: AuditTokenOpts
+  ): Promise<number> {
+    // Raydium: vault PC (WSOL) — 1 sola getTokenAccountBalance
+    if (opts?.pcVault) {
+      const pcBalance = await this.connection
+        .getTokenAccountBalance(new PublicKey(opts.pcVault))
+        .catch(() => null);
+      const fromPc = pcBalance?.value.uiAmount ?? 0;
+      if (fromPc > 0) return fromPc;
+
+      // Si pcVault no era WSOL, probar coinVault
+      if (opts.coinVault) {
+        const coinBalance = await this.connection
+          .getTokenAccountBalance(new PublicKey(opts.coinVault))
+          .catch(() => null);
+        return coinBalance?.value.uiAmount ?? 0;
+      }
+      return 0;
+    }
+
+    // Pump / fallback: lamports nativos en bonding curve / pool
+    const lamports = await this.connection.getBalance(pool).catch(() => 0);
+    return lamports / 1e9;
   }
 
   /** Lee balances reales de vaults Raydium (no del AMM id). */
