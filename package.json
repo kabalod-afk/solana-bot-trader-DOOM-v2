@@ -1,0 +1,32 @@
+{
+  "name": "doom-v2",
+  "version": "2.1.0-helios",
+  "description": "DOOM v2 — Quantitative trading engine for Solana DEX",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "bip39": "^3.1.0",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.7",
+    "ed25519-hd-key": "^2.0.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/bip39": "^2.4.2",
+    "@types/node": "^22.10.0",
+    "@types/node-telegram-bot-api": "^0.64.7",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
