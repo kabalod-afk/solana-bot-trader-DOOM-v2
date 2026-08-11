@@ -207,7 +207,8 @@ async function bootstrap(): Promise<void> {
       const obsResult = await observer.observeWindow(
         event.poolAddress,
         b0Result.initialPoolSol,
-        event.deployerAddress
+        event.deployerAddress,
+        b0Result.initialMcUSD
       );
 
       if (!obsResult.passed) {
@@ -215,6 +216,12 @@ async function bootstrap(): Promise<void> {
         activeTokensSet.delete(token);
         scheduler.releaseThread();
         return;
+      }
+
+      if (obsResult.trigger) {
+        console.log(
+          `[WINDOW_PASS] ${token}: trigger=${obsResult.trigger} t=${obsResult.observationTimeMs}ms`
+        );
       }
 
       const balanceLamports = await connection.getBalance(walletA.publicKey);
