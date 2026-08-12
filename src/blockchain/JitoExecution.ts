@@ -7,6 +7,14 @@ import {
   TransactionMessage,
   ComputeBudgetProgram,
 } from '@solana/web3.js';
+import bs58 from 'bs58';
+
+export interface ExecResult {
+  ok: boolean;
+  signature: string;
+}
+
+const FAIL: ExecResult = { ok: false, signature: '' };
 
 type SwapType = 'BUY' | 'SELL_RATIO' | 'SELL_ALL';
 
@@ -32,14 +40,14 @@ export class JitoExecution {
       'https://mainnet.block-engine.jito.wtf';
   }
 
-  async executeBuy(tokenAddress: string, amountSol: number): Promise<boolean> {
+  async executeBuy(tokenAddress: string, amountSol: number): Promise<ExecResult> {
     try {
       console.log(`[JITO_BUY_REAL] Firmando swap ${amountSol} SOL -> ${tokenAddress}`);
       const tx = await this.buildSwapTransaction(tokenAddress, amountSol, 'BUY');
       return await this.sendJitoBundle(tx, 0.005);
     } catch (e) {
       console.error('[JITO_BUY_ERROR] Fallo en compra:', e);
-      return false;
+      return FAIL;
     }
   }
 
@@ -47,8 +55,8 @@ export class JitoExecution {
     tokenAddress: string,
     amountUSD: number,
     currentPriceUSD: number
-  ): Promise<boolean> {
-    if (currentPriceUSD <= 0 || amountUSD <= 0) return false;
+  ): Promise<ExecResult> {
+    if (currentPriceUSD <= 0 || amountUSD <= 0) return FAIL;
     const tokensToSell = amountUSD / currentPriceUSD;
     console.log(
       `[JITO_SELL_USD] Venta parcial $${amountUSD} USD (~${tokensToSell.toFixed(4)} tokens)`
@@ -62,16 +70,16 @@ export class JitoExecution {
       );
       const uiBal =
         parsed.value[0]?.account.data.parsed?.info?.tokenAmount?.uiAmount ?? 0;
-      if (uiBal <= 0) return false;
+      if (uiBal <= 0) return FAIL;
       const ratio = Math.min(1, Math.max(0, tokensToSell / uiBal));
       return this.executePartialSellByRatio(tokenAddress, ratio);
     } catch (e) {
       console.error('[JITO_SELL_USD] Error resolviendo balance:', e);
-      return false;
+      return FAIL;
     }
   }
 
-  async executePartialSellByRatio(tokenAddress: string, ratio: number): Promise<boolean> {
+  async executePartialSellByRatio(tokenAddress: string, ratio: number): Promise<ExecResult> {
     try {
       const safeRatio = Math.min(1, Math.max(0, ratio));
       console.log(
@@ -81,29 +89,29 @@ export class JitoExecution {
       return await this.sendJitoBundle(tx, 0.005);
     } catch (e) {
       console.error('[JITO_SELL_ERROR] Fallo en venta parcial:', e);
-      return false;
+      return FAIL;
     }
   }
 
-  async executeFullSell(tokenAddress: string): Promise<boolean> {
+  async executeFullSell(tokenAddress: string): Promise<ExecResult> {
     try {
       console.log(`[JITO_FULL_SELL] Venta 100% de ${tokenAddress}`);
       const tx = await this.buildSwapTransaction(tokenAddress, 1.0, 'SELL_ALL');
       return await this.sendJitoBundle(tx, 0.01);
     } catch (e) {
       console.error('[JITO_FULL_SELL_ERROR] Fallo en venta total:', e);
-      return false;
+      return FAIL;
     }
   }
 
-  async executeEmergencyEvacuation(tokenAddress: string): Promise<boolean> {
+  async executeEmergencyEvacuation(tokenAddress: string): Promise<ExecResult> {
     try {
       console.log('[JITO_EMERGENCY] EVACUANDO CON PROPINA DE 0.50 SOL...');
       const tx = await this.buildSwapTransaction(tokenAddress, 1.0, 'SELL_ALL');
       return await this.sendJitoBundle(tx, 0.5);
     } catch (e) {
       console.error('[JITO_EMERGENCY_ERROR] Fallo crítico de evacuación:', e);
-      return false;
+      return FAIL;
     }
   }
 
@@ -189,7 +197,17 @@ export class JitoExecution {
     }
   }
 
-  private async sendJitoBundle(tx: VersionedTransaction, tipSol: number): Promise<boolean> {
+  private signatureOf(tx: VersionedTransaction): string {
+    try {
+      const sig = tx.signatures[0];
+      if (!sig || sig.every((b) => b === 0)) return '';
+      return bs58.encode(sig);
+    } catch {
+      return '';
+    }
+  }
+
+  private async sendJitoBundle(tx: VersionedTransaction, tipSol: number): Promise<ExecResult> {
     const tipLamports = Math.floor(tipSol * 1e9);
     const tipAccount = new PublicKey(
       JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
@@ -233,7 +251,7 @@ export class JitoExecution {
       return null;
     });
 
-    if (!response) return false;
+    if (!response) return FAIL;
     const body = (await response.json().catch(() => null)) as {
       result?: string;
       error?: unknown;
@@ -252,14 +270,15 @@ export class JitoExecution {
           { signature: sig, ...latest },
           'confirmed'
         );
-        return true;
+        return { ok: true, signature: sig };
       } catch (e) {
         console.error('[JITO_FALLBACK_RPC] Fallo:', e);
-        return false;
+        return FAIL;
       }
     }
 
-    console.log(`[JITO_BUNDLE] OK bundleId=${body.result}`);
-    return true;
+    const swapSig = this.signatureOf(tx);
+    console.log(`[JITO_BUNDLE] OK bundleId=${body.result} swap=${swapSig}`);
+    return { ok: true, signature: swapSig };
   }
 }

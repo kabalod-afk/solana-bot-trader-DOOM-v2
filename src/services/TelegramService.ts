@@ -72,17 +72,101 @@ export class TelegramService {
   }
 
   public async sendText(msg: string): Promise<void> {
+    await this.sendHtml(this.toHtml(msg), msg.replace(/[*_`]/g, ''));
+  }
+
+  /** HTML ya construido (no re-escapa tags). */
+  public async sendHtml(html: string, plainFallback?: string): Promise<void> {
     try {
-      await this.bot.sendMessage(this.chatId, this.toHtml(msg), {
+      await this.bot.sendMessage(this.chatId, html, {
         parse_mode: 'HTML',
+        disable_web_page_preview: true,
       });
-    } catch (error) {
+    } catch {
       try {
-        await this.bot.sendMessage(this.chatId, msg.replace(/[*_`]/g, ''));
+        await this.bot.sendMessage(
+          this.chatId,
+          plainFallback ?? html.replace(/<[^>]+>/g, '')
+        );
       } catch (e2) {
         console.error('[TELEGRAM_ERROR]', e2);
       }
     }
+  }
+
+  private esc(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  private ticker(mint: string, symbol?: string): string {
+    if (symbol && symbol.trim()) return this.esc(symbol.trim());
+    return this.esc(mint.slice(0, 6));
+  }
+
+  /** Paso 1: B0 aprobado → radar / ventana de impulso. */
+  public async notifyRadarEntry(
+    mint: string,
+    poolSol: number,
+    mcUsd: number,
+    symbol?: string
+  ): Promise<void> {
+    const msg =
+      `📡 <b>[RADAR B0] Token Aprobado</b>\n\n` +
+      `• <b>Token:</b> $${this.ticker(mint, symbol)}\n` +
+      `• <b>Mint:</b> <code>${this.esc(mint)}</code>\n` +
+      `• <b>Pool Inicial:</b> ${poolSol.toFixed(2)} SOL\n` +
+      `• <b>MC Inicial:</b> $${mcUsd.toFixed(0)} USD\n` +
+      `• <b>Estado:</b> Monitoreando impulso (Máx 45s)...`;
+    await this.sendHtml(msg);
+  }
+
+  /** Paso 2: compra ejecutada. */
+  public async notifyBuyExecuted(
+    mint: string,
+    currentMc: number,
+    txs: number,
+    amountSol: number,
+    txHash: string,
+    symbol?: string
+  ): Promise<void> {
+    const hash = this.esc(txHash || 'pendiente');
+    const link = txHash
+      ? `<a href="https://solscan.io/tx/${hash}">Ver en Solscan</a>`
+      : 'pendiente';
+    const msg =
+      `🎯 <b>[BUY TRIGGERED] Breakout Confirmado</b>\n\n` +
+      `• <b>Token:</b> $${this.ticker(mint, symbol)}\n` +
+      `• <b>MC Actual:</b> $${currentMc.toFixed(0)} USD\n` +
+      `• <b>Confirmaciones:</b> ${txs} txs\n` +
+      `• <b>Monto Entrada:</b> ${amountSol} SOL\n` +
+      `• <b>Tx:</b> ${link}`;
+    await this.sendHtml(msg);
+  }
+
+  /** Paso 3: venta + informe PnL. */
+  public async notifyTradeClosed(
+    mint: string,
+    reason: string,
+    pnlSol: number,
+    pnlPercent: number,
+    durationSec: number,
+    txHash: string,
+    symbol?: string
+  ): Promise<void> {
+    const icon = pnlSol >= 0 ? '🟢' : '🔴';
+    const hash = this.esc(txHash || '');
+    const link = txHash
+      ? `<a href="https://solscan.io/tx/${hash}">Ver en Solscan</a>`
+      : 'n/d';
+    const msg =
+      `🏁 <b>[TRADE CLOSED] Operación Finalizada</b>\n\n` +
+      `• <b>Token:</b> $${this.ticker(mint, symbol)}\n` +
+      `• <b>Motivo Cierre:</b> ${this.esc(reason)}\n\n` +
+      `<b>📊 Informe de Operación:</b>\n` +
+      `├─ <b>Tiempo Transcurrido:</b> ${durationSec}s\n` +
+      `└─ <b>PnL Neto:</b> ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(3)} SOL (${pnlPercent.toFixed(1)}%) ${icon}\n\n` +
+      `• <b>Tx Venta:</b> ${link}`;
+    await this.sendHtml(msg);
   }
 
   /**
@@ -95,18 +179,16 @@ export class TelegramService {
 
   /** Alias: token superó B0 y entra a ventana dinámica. */
   notifyAnalysisPassed(
-    botId: string,
+    _botId: string,
     token: string,
     mcUSD: number,
     poolSol: number
   ): void {
-    this.notifyAnalysis(botId, token, mcUSD, poolSol);
+    void this.notifyRadarEntry(token, poolSol, mcUSD);
   }
 
-  notifyAnalysis(botId: string, token: string, mcUSD: number, poolSol: number): void {
-    void this.sendText(
-      `🤖 *[${botId}]* 🔍 *ANALIZANDO TOKEN*\n• Token: \`${token}\`\n• MC Inicial: $${mcUSD.toFixed(0)} USD\n• Pool: ${poolSol} SOL\n⏱ En ventana dinámica 0-45s...`
-    );
+  notifyAnalysis(_botId: string, token: string, mcUSD: number, poolSol: number): void {
+    void this.notifyRadarEntry(token, poolSol, mcUSD);
   }
 
   notifyStart(

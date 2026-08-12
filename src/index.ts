@@ -243,8 +243,8 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
-      const buyOk = await jito.executeBuy(token, obsResult.entrySizeSol);
-      if (!buyOk) {
+      const buy = await jito.executeBuy(token, obsResult.entrySizeSol);
+      if (!buy.ok) {
         activeTokensSet.delete(token);
         scheduler.releaseThread();
         return;
@@ -261,6 +261,13 @@ async function bootstrap(): Promise<void> {
       const opNum = opCounter++;
 
       telegram.notifyStart(botInstanceId, opNum, token, obsResult.entrySizeSol, entryPrice);
+      void telegram.notifyBuyExecuted(
+        token,
+        obsResult.currentMcUsd ?? entryTick.mcUSD,
+        obsResult.txCount,
+        obsResult.entrySizeSol,
+        buy.signature
+      );
 
       const engine = new TradeEngine(
         botInstanceId,

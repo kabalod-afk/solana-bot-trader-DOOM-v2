@@ -58,7 +58,7 @@ export class TradeEngine {
     }
 
     if (this.forceCloseRequested) {
-      await this.jito.executeFullSell(this.tokenAddress);
+      const sell = await this.jito.executeFullSell(this.tokenAddress);
       const pnl =
         (metrics.currentPriceUSD / this.entryPriceUSD - 1) * this.currentSolExposed;
       const vaultSweep = Math.max(0, pnl);
@@ -69,19 +69,13 @@ export class TradeEngine {
         metrics.buyVolumeRatio,
         false
       );
-      this.telegram.notifySummary(
-        this.instanceBotId,
-        this.tokenAddress,
-        this.baseInvestmentSol,
-        pnl,
-        vaultSweep
-      );
+      await this.reportClose('Cierre forzado (Telegram)', pnl, sell.signature);
       return 'CLOSED';
     }
 
     // 1. RUG PULL
     if (metrics.isDevSelling) {
-      await this.jito.executeEmergencyEvacuation(this.tokenAddress);
+      const sell = await this.jito.executeEmergencyEvacuation(this.tokenAddress);
       void this.telegram.sendText(
         `🚨 *[${this.instanceBotId}] RUG PULL EN MEMPOOL.* Evacuado vía Jito.`
       );
@@ -93,19 +87,17 @@ export class TradeEngine {
         true,
         this.deployerAddress
       );
-      this.telegram.notifySummary(
-        this.instanceBotId,
-        this.tokenAddress,
-        this.baseInvestmentSol,
+      await this.reportClose(
+        'Rug pull (dev vendiendo)',
         -this.currentSolExposed,
-        0
+        sell.signature
       );
       return 'CLOSED';
     }
 
     // 2. TECHO DE MILLONES
     if (metrics.mcUSD >= 8_000_000) {
-      await this.jito.executeFullSell(this.tokenAddress);
+      const sell = await this.jito.executeFullSell(this.tokenAddress);
       const netProfit =
         (metrics.currentPriceUSD / this.entryPriceUSD - 1) * this.currentSolExposed;
 
@@ -116,13 +108,7 @@ export class TradeEngine {
         metrics.buyVolumeRatio,
         false
       );
-      this.telegram.notifySummary(
-        this.instanceBotId,
-        this.tokenAddress,
-        this.baseInvestmentSol,
-        netProfit,
-        Math.max(0, netProfit)
-      );
+      await this.reportClose('Techo $8M MC', netProfit, sell.signature);
       return 'CLOSED';
     }
 
@@ -130,7 +116,7 @@ export class TradeEngine {
     const dropFromPeak =
       (this.highestPriceUSD - metrics.currentPriceUSD) / this.highestPriceUSD;
     if (dropFromPeak >= 0.3) {
-      await this.jito.executeFullSell(this.tokenAddress);
+      const sell = await this.jito.executeFullSell(this.tokenAddress);
       const pnl =
         (metrics.currentPriceUSD / this.entryPriceUSD - 1) * this.currentSolExposed;
       const vaultSweep = Math.max(0, pnl);
@@ -143,13 +129,7 @@ export class TradeEngine {
         metrics.buyVolumeRatio,
         false
       );
-      this.telegram.notifySummary(
-        this.instanceBotId,
-        this.tokenAddress,
-        this.baseInvestmentSol,
-        pnl,
-        vaultSweep
-      );
+      await this.reportClose('Trailing −30% ATH', pnl, sell.signature);
       return 'CLOSED';
     }
 
@@ -165,7 +145,7 @@ export class TradeEngine {
         this.tokenAddress,
         deriskSensitivity
       );
-      if (ok) {
+      if (ok.ok) {
         this.hasDerisked = true;
         this.currentSolExposed -= solToReduce;
         this.telegram.notifyDerisk(
@@ -188,7 +168,7 @@ export class TradeEngine {
     ) {
       const boostSol = this.baseInvestmentSol * 0.5;
       const ok = await this.jito.executeBuy(this.tokenAddress, boostSol);
-      if (ok) {
+      if (ok.ok) {
         this.hasReinjected = true;
         this.currentSolExposed += boostSol;
         this.telegram.notifyBoost(this.instanceBotId, boostSol, this.currentSolExposed);
@@ -209,7 +189,7 @@ export class TradeEngine {
         80,
         metrics.currentPriceUSD
       );
-      if (ok) {
+      if (ok.ok) {
         await this.vault.routeTakeProfitCoverage(80, solPrice);
         this.hasTakenProfit = true;
         this.telegram.notifyTakeProfit(
@@ -227,7 +207,7 @@ export class TradeEngine {
         120,
         metrics.currentPriceUSD
       );
-      if (ok) {
+      if (ok.ok) {
         await this.vault.routeTakeProfitCoverage(120, solPrice);
         this.hasTakenProfit = true;
         this.telegram.notifyTakeProfit(
@@ -248,7 +228,7 @@ export class TradeEngine {
       metrics.txPerMinute < 10 &&
       !this.hasTakenProfit
     ) {
-      await this.jito.executeFullSell(this.tokenAddress);
+      const sell = await this.jito.executeFullSell(this.tokenAddress);
       const pnl = (currentMult - 1) * this.currentSolExposed;
 
       this.helios.updateAfterTrade(
@@ -258,16 +238,24 @@ export class TradeEngine {
         false
       );
       this.telegram.notifyStagnantExit(this.instanceBotId, this.tokenAddress);
-      this.telegram.notifySummary(
-        this.instanceBotId,
-        this.tokenAddress,
-        this.baseInvestmentSol,
-        pnl,
-        0
-      );
+      await this.reportClose('Estancamiento 4 min', pnl, sell.signature);
       return 'CLOSED';
     }
 
     return 'RUNNING';
+  }
+
+  private async reportClose(reason: string, pnlSol: number, txHash: string): Promise<void> {
+    const durationSec = Math.max(0, Math.round((Date.now() - this.entryTimeMs) / 1000));
+    const pnlPercent =
+      this.baseInvestmentSol > 0 ? (pnlSol / this.baseInvestmentSol) * 100 : 0;
+    await this.telegram.notifyTradeClosed(
+      this.tokenAddress,
+      reason,
+      pnlSol,
+      pnlPercent,
+      durationSec,
+      txHash
+    );
   }
 }

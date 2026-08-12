@@ -8,6 +8,8 @@ export interface ObservationResult {
   entrySizeSol: number;
   buyVolumeRatio: number;
   observationTimeMs: number;
+  txCount: number;
+  currentMcUsd?: number;
   trigger?: 'helios' | 'volume_burst' | 'organic_impulse';
 }
 
@@ -112,6 +114,7 @@ export class WindowObserver {
         entrySizeSol: 0,
         buyVolumeRatio: 0,
         observationTimeMs: 0,
+        txCount: 0,
       };
     }
 
@@ -171,6 +174,8 @@ export class WindowObserver {
             entrySizeSol: 0,
             buyVolumeRatio: buyRatio,
             observationTimeMs: elapsedTime,
+            txCount: totalTx,
+            currentMcUsd: tracking.currentMcUsd,
           };
         }
 
@@ -186,6 +191,8 @@ export class WindowObserver {
             entrySizeSol: isHighConviction ? 1.5 : 1.0,
             buyVolumeRatio: buyRatio,
             observationTimeMs: elapsedTime,
+            txCount: totalTx,
+            currentMcUsd: tracking.currentMcUsd,
             trigger: isBurst ? 'volume_burst' : 'organic_impulse',
           };
         }
@@ -204,6 +211,8 @@ export class WindowObserver {
             entrySizeSol: isHighConviction ? 1.5 : 1.0,
             buyVolumeRatio: buyRatio,
             observationTimeMs: elapsedTime,
+            txCount: totalTx,
+            currentMcUsd: tracking.currentMcUsd,
             trigger: 'helios',
           };
         }
@@ -220,6 +229,8 @@ export class WindowObserver {
       entrySizeSol: 0,
       buyVolumeRatio: 0,
       observationTimeMs: MAX_WINDOW_MS,
+      txCount: totalBuys + totalSells,
+      currentMcUsd: tracking.currentMcUsd,
     };
   }
 
