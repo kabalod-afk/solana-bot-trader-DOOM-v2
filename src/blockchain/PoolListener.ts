@@ -183,6 +183,21 @@ export function redactWssUrl(url: string): string {
   }
 }
 
+/** primary + beta.helius (misma api-key) por si mainnet WSS da 522. */
+export function buildWssEndpointList(primary: string): string[] {
+  const list = [primary];
+  try {
+    const u = new URL(primary);
+    const key = u.searchParams.get('api-key') || '';
+    if (key && !u.host.startsWith('beta.')) {
+      list.push(`wss://beta.helius-rpc.com/?api-key=${key}`);
+    }
+  } catch {
+    /* keep primary only */
+  }
+  return list;
+}
+
 export class PoolListener {
   private ws: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -192,18 +207,23 @@ export class PoolListener {
   private reconnectAttempt = 0;
   private connecting = false;
   private lastErrorWas522 = false;
-  private readonly safeEndpoint: string;
+  private endpointIndex = 0;
+  private readonly endpoints: string[];
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
-    private wssUrl: string,
+    wssUrl: string,
     private connection: Connection,
     private onNewPoolCallback: (event: NewPoolEvent) => void | Promise<void>,
     /** false → descarta antes de getTransaction (máx. concurrencia RPC). */
     private tryAcquireRpc?: () => boolean,
     private releaseRpc?: () => void
   ) {
-    this.wssUrl = normalizeHeliusWssUrl(wssUrl);
-    this.safeEndpoint = redactWssUrl(this.wssUrl);
+    this.endpoints = buildWssEndpointList(normalizeHeliusWssUrl(wssUrl));
+  }
+
+  private currentUrl(): string {
+    return this.endpoints[this.endpointIndex % this.endpoints.length];
   }
 
   public start(): void {
@@ -213,6 +233,7 @@ export class PoolListener {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.clearPing();
 
     if (this.ws) {
       try {
@@ -224,18 +245,30 @@ export class PoolListener {
       this.ws = null;
     }
 
+    const url = this.currentUrl();
     this.connecting = true;
-    console.log(`📡 [HELIUS_WS] Conectando a ${this.safeEndpoint} ...`);
-    this.ws = new WebSocket(this.wssUrl);
+    console.log(`📡 [HELIUS_WS] Conectando a ${redactWssUrl(url)} ...`);
+    this.ws = new WebSocket(url);
 
     this.ws.on('open', () => {
       this.connecting = false;
       this.reconnectAttempt = 0;
       this.lastErrorWas522 = false;
       console.log(
-        '📡 [HELIUS_WS] Conectado — Raydium initialize2 + Pump create (ALT-aware).'
+        `📡 [HELIUS_WS] Conectado (${redactWssUrl(url)}) — Raydium initialize2 + Pump create.`
       );
       this.subscribeToProgramLogs();
+      this.clearPing();
+      // Helius corta a los ~10 min sin tráfico
+      this.pingTimer = setInterval(() => {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          try {
+            this.ws.ping();
+          } catch {
+            /* ignore */
+          }
+        }
+      }, 45_000);
     });
 
     this.ws.on('message', (data: WebSocket.RawData) => {
@@ -245,26 +278,40 @@ export class PoolListener {
     this.ws.on('error', (err) => {
       const msg = err.message || String(err);
       this.lastErrorWas522 = /522|cloudflare|timed out/i.test(msg);
-      console.error(`❌ [HELIUS_WS_ERROR] ${msg} (${this.safeEndpoint})`);
+      console.error(`❌ [HELIUS_WS_ERROR] ${msg} (${redactWssUrl(url)})`);
       if (this.lastErrorWas522) {
         console.error(
-          '[HELIUS_WS] HTTP 522 = origen Helius no responde. Revisa SOLANA_WSS_URL / API key en dashboard.helius.dev'
+          '[HELIUS_WS] HTTP 522 = origen Helius no responde. Prueba otra API key o wss://beta.helius-rpc.com'
         );
       }
     });
 
     this.ws.on('close', () => {
       this.connecting = false;
+      this.clearPing();
       this.ws = null;
       if (this.stopped) return;
-      if (this.reconnectTimer) return; // ya programado
+      if (this.reconnectTimer) return;
       this.scheduleReconnect();
     });
   }
 
+  private clearPing(): void {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
   private scheduleReconnect(): void {
     this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 8);
-    // 522: no martillar; mínimo 15s y sube hasta 2 min
+    // Tras 2 fallos 522, rota a beta.helius-rpc.com
+    if (this.lastErrorWas522 && this.reconnectAttempt % 2 === 0 && this.endpoints.length > 1) {
+      this.endpointIndex = (this.endpointIndex + 1) % this.endpoints.length;
+      console.log(
+        `[HELIUS_WS] Rotando endpoint → ${redactWssUrl(this.currentUrl())}`
+      );
+    }
     const base = this.lastErrorWas522 ? 15_000 : 3_000;
     const cap = this.lastErrorWas522 ? 120_000 : 60_000;
     const delayMs = Math.min(cap, base * 2 ** (this.reconnectAttempt - 1));
@@ -280,6 +327,7 @@ export class PoolListener {
   public stop(): void {
     this.stopped = true;
     this.connecting = false;
+    this.clearPing();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     try {

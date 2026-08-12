@@ -1,4 +1,4 @@
-import { Connection, PublicKey, LogsCallback } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { HeliosEngine } from '../core/HeliosEngine';
 import { loadMomentumConfig } from '../core/momentumConfig';
 
@@ -138,27 +138,16 @@ export class WindowObserver {
       };
     }
 
+    // Sin onLogs (Connection WS): solo HTTP getBalance — evita segundo socket 522 a Helius
     const logBuffer: string[] = [];
     let lastSolRpcAt = 0;
-    const onLogs: LogsCallback = (logs) => {
-      if (logs.err) return;
-      for (const line of logs.logs) {
-        logBuffer.push(line);
-      }
-    };
-
-    const subId = this.connection.onLogs(pool, onLogs, 'confirmed');
 
     try {
       while (Date.now() - startTime < MAX_WINDOW_MS) {
         const elapsedPre = Date.now() - startTime;
-        const hasSellHint = logBuffer.some((line) =>
-          /sell|remove|withdraw|close/i.test(line)
-        );
-        // RPC solo tras ventana mínima Helios, o si los logs piden validar drain
+        // Poll SOL cada 2s tras 3s (sin logs WS)
         const forceRpc =
-          (elapsedPre >= minWindowMs && Date.now() - lastSolRpcAt >= 6_000) ||
-          hasSellHint;
+          elapsedPre >= 3_000 && Date.now() - lastSolRpcAt >= 2_000;
         const ticks = await this.consumeTicks(
           pool,
           logBuffer,
@@ -261,8 +250,8 @@ export class WindowObserver {
 
         await new Promise((r) => setTimeout(r, 2_000));
       }
-    } finally {
-      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    } catch (e) {
+      console.error('[WINDOW_ERROR]', e);
     }
 
     return {
@@ -341,9 +330,10 @@ export class WindowObserver {
       initialPoolSol > 0 &&
       currentPoolSol > 0.01 &&
       currentPoolSol < initialPoolSol * 0.9;
-    const volumeSolIn = Math.max(0, currentPoolSol - lastPoolSol);
+    const delta = currentPoolSol - lastPoolSol;
+    const volumeSolIn = Math.max(0, delta);
 
-    if (buys + sells === 0 && volumeSolIn <= 0) {
+    if (buys + sells === 0 && Math.abs(delta) <= 0.001) {
       return {
         buys: 0,
         sells: 0,
@@ -357,9 +347,13 @@ export class WindowObserver {
       };
     }
 
-    // Si hay inflow de SOL sin clasificar logs, contar como buy implícito
-    if (buys + sells === 0 && volumeSolIn > 0) {
-      buys = 1;
+    // Sin logs WS: inflow = buy, outflow = sell (proxy)
+    if (buys + sells === 0) {
+      if (delta > 0.001) buys = 1;
+      else if (delta < -0.001) {
+        sells = 1;
+        hasThirdPartySell = true;
+      }
     }
 
     return {

@@ -56,9 +56,19 @@ async function bootstrap(): Promise<void> {
 
   const connection = new Connection(rpcUrl, {
     commitment: 'confirmed',
-    wsEndpoint: wssUrl,
+    // Sin wsEndpoint: evita 2º socket WSS (web3 onLogs). Solo PoolListener usa WSS.
     disableRetryOnRateLimit: true,
   });
+
+  // Health check HTTP (si falla, la key/plan está mal — no solo el WSS)
+  try {
+    const health = await connection.getSlot('processed');
+    console.log(`RPC health OK — slot ${health}`);
+  } catch (e) {
+    console.error(
+      `[RPC_HEALTH] HTTP falló: ${e instanceof Error ? e.message : e}. Revisa SOLANA_RPC_URL / API key.`
+    );
+  }
 
   const loaded = loadWalletA();
   const walletA = loaded.keypair;
