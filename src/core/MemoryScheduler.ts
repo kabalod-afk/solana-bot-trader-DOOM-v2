@@ -4,13 +4,13 @@ export class MemoryScheduler {
   private activeThreads = 0;
   private nextBotSerial = 1;
   private inflightAudits = 0;
-  /** Máx. resoluciones/auditorías RPC en paralelo (WS → getTx + B0). */
-  private readonly MAX_INFLIGHT = 2;
+  /** Máx. 1 cadena getTx→B0 a la vez (ahorro Helius). */
+  private readonly MAX_INFLIGHT = 1;
 
   public canSpawnThread(): boolean {
     const freeRamGB = os.freemem() / (1024 * 1024 * 1024);
-    const maxAllowedThreads = Math.floor(freeRamGB * 2);
-    if (maxAllowedThreads < 1) return false;
+    // Piso 1: un droplet 1 GB no debe quedar en 0 hilos por RAM fragmentada
+    const maxAllowedThreads = Math.max(1, Math.floor(freeRamGB * 2));
     return this.activeThreads < maxAllowedThreads;
   }
 

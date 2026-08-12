@@ -1,12 +1,15 @@
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { HeliosEngine } from '../core/HeliosEngine';
 import { loadMomentumConfig } from '../core/momentumConfig';
+import { getCachedSolPrice } from '../core/solPriceCache';
+import { isLiveTrading, jupiterConfig } from '../core/jupiter';
 
 export interface BlockZeroResult {
   passed: boolean;
   reason?: string;
   initialMcUSD: number;
   initialPoolSol: number;
+  totalSupply?: number;
 }
 
 export interface AuditTokenOpts {
@@ -34,10 +37,11 @@ export class BlockZeroScanner {
     deployerAddress: string,
     opts?: AuditTokenOpts
   ): Promise<BlockZeroResult> {
-    if (this.helios.isBlacklisted(deployerAddress)) {
+    const heliosSkip = this.helios.shouldSkipAnalysis(deployerAddress);
+    if (heliosSkip) {
       return {
         passed: false,
-        reason: 'Deployer en Blacklist de Helios',
+        reason: heliosSkip.reason,
         initialMcUSD: 0,
         initialPoolSol: 0,
       };
@@ -75,16 +79,17 @@ export class BlockZeroScanner {
       };
     }
 
-    // Solo si supera el mínimo Helios: métricas completas + filtros + Jupiter
+    // Solo si supera el mínimo: métricas (reusa SOL del quick check)
     const poolMetrics =
       opts?.source === 'pump'
         ? await this.fetchPumpBondingMetrics(
             pool,
             mint,
-            opts.associatedBondingCurve
+            opts.associatedBondingCurve,
+            quickSol
           )
         : opts?.source === 'raydium' && opts.coinVault && opts.pcVault
-          ? await this.fetchRaydiumVaultMetrics(opts.coinVault, opts.pcVault, mint)
+          ? await this.fetchRaydiumVaultMetrics(opts.coinVault, opts.pcVault, mint, quickSol)
           : await this.fetchPoolMetricsFallback(pool, mint);
 
     // Revalidar SOL con lectura completa (puede diferir del quick check)
@@ -106,7 +111,7 @@ export class BlockZeroScanner {
       };
     }
 
-    const solPriceUSD = await this.getRealSolPriceUSD();
+    const solPriceUSD = getCachedSolPrice();
     const initialMcUSD =
       ((poolMetrics.solAmount * solPriceUSD) / poolMetrics.tokenAmount) *
       poolMetrics.totalSupply;
@@ -125,18 +130,22 @@ export class BlockZeroScanner {
       };
     }
 
-    const tokenAccountInfo = await this.connection.getAccountInfo(mint);
-    if (!tokenAccountInfo || tokenAccountInfo.data.length < 82) {
-      return {
-        passed: false,
-        reason: 'No se pudo leer la cuenta Mint SPL',
-        initialMcUSD,
-        initialPoolSol: poolMetrics.solAmount,
-      };
+    let mintSafe = poolMetrics.mintSafe;
+    if (mintSafe === undefined) {
+      const tokenAccountInfo = await this.connection.getAccountInfo(mint);
+      if (!tokenAccountInfo || tokenAccountInfo.data.length < 82) {
+        return {
+          passed: false,
+          reason: 'No se pudo leer la cuenta Mint SPL',
+          initialMcUSD,
+          initialPoolSol: poolMetrics.solAmount,
+        };
+      }
+      mintSafe =
+        tokenAccountInfo.data.readUInt32LE(0) === 0 &&
+        tokenAccountInfo.data.readUInt32LE(46) === 0;
     }
-
-    const data = tokenAccountInfo.data;
-    if (data.readUInt32LE(0) !== 0 || data.readUInt32LE(46) !== 0) {
+    if (!mintSafe) {
       return {
         passed: false,
         reason: 'Contrato Inseguro (Mint/Freeze Authority activa)',
@@ -161,30 +170,46 @@ export class BlockZeroScanner {
       };
     }
 
-    if (await this.traceCabalFundingOnChain(deployer)) {
+    const liveTrading = isLiveTrading();
+
+    // Cabal: JSON primero (serial / sospechoso). RPC solo la 1ª-2ª vez en LIVE.
+    if (this.helios.isSerialCabal(deployerAddress)) {
       return {
         passed: false,
-        reason: 'Cluster de Cabal/Bundling detectado',
+        reason: 'Helios JSON: cluster cabal serial',
         initialMcUSD,
         initialPoolSol: poolMetrics.solAmount,
       };
     }
+    const mem = this.helios.brain.analysis_memory.deployers[deployerAddress];
+    if (liveTrading && (mem?.windowSeen ?? 0) <= 2) {
+      if (await this.traceCabalFundingOnChain(deployer)) {
+        return {
+          passed: false,
+          reason: 'Cluster de Cabal/Bundling detectado',
+          initialMcUSD,
+          initialPoolSol: poolMetrics.solAmount,
+        };
+      }
+    }
 
-    // Jupiter chained quote solo tras pasar liquidez + seguridad on-chain
-    const dryRunOk = await this.simulateChainedBuySell(tokenAddress);
-    if (!dryRunOk) {
-      return {
-        passed: false,
-        reason: 'Dry-Run fallido (Buy→Sell tax >5% o Honeypot / sin ruta)',
-        initialMcUSD,
-        initialPoolSol: poolMetrics.solAmount,
-      };
+    if (liveTrading) {
+      const dryRunOk = await this.simulateChainedBuySell(tokenAddress);
+      if (!dryRunOk) {
+        return {
+          passed: false,
+          reason: 'Dry-Run fallido (Buy→Sell tax >5% o Honeypot / sin ruta)',
+          initialMcUSD,
+          initialPoolSol: poolMetrics.solAmount,
+        };
+      }
     }
 
     return {
       passed: true,
       initialMcUSD,
       initialPoolSol: poolMetrics.solAmount,
+      totalSupply: poolMetrics.totalSupply,
     };
   }
 
@@ -218,120 +243,132 @@ export class BlockZeroScanner {
     return lamports / 1e9;
   }
 
-  /** Pump: SOL en bonding_curve + tokens en associated_bonding_curve. */
+  /** Pump: reusa SOL del quick check; 1 getMultipleAccounts (mint + ABC). */
   private async fetchPumpBondingMetrics(
-    bondingCurve: PublicKey,
+    _bondingCurve: PublicKey,
     mint: PublicKey,
-    associatedBondingCurve?: string
+    associatedBondingCurve: string | undefined,
+    knownSol: number
   ) {
-    const solAmount =
-      (await this.connection.getBalance(bondingCurve).catch(() => 0)) / 1e9;
-
+    const PUMP_SUPPLY = 1_000_000_000;
     let tokenAmount = 0;
+    let totalSupply = PUMP_SUPPLY;
+    let mintSafe: boolean | undefined;
+
+    const keys: PublicKey[] = [mint];
     if (associatedBondingCurve) {
-      try {
-        const bal = await this.connection.getTokenAccountBalance(
-          new PublicKey(associatedBondingCurve)
-        );
-        tokenAmount = bal.value.uiAmount ?? 0;
-      } catch {
-        tokenAmount = 0;
-      }
+      keys.push(new PublicKey(associatedBondingCurve));
     }
 
-    // Fallback: ATA del bonding curve como owner
-    if (tokenAmount <= 0) {
-      try {
-        const atas = await this.connection.getParsedTokenAccountsByOwner(bondingCurve, {
-          mint,
-        });
-        tokenAmount =
-          atas.value[0]?.account.data.parsed?.info?.tokenAmount?.uiAmount ?? 0;
-      } catch {
-        tokenAmount = 0;
-      }
-    }
-
-    let totalSupply = 0;
     try {
-      const supply = await this.connection.getTokenSupply(mint);
-      totalSupply = supply.value.uiAmount ?? 0;
+      const accs = await this.connection.getMultipleAccountsInfo(keys);
+      const mintData = accs[0]?.data;
+      if (mintData && mintData.length >= 82) {
+        mintSafe =
+          mintData.readUInt32LE(0) === 0 && mintData.readUInt32LE(46) === 0;
+        const decimals = mintData[44];
+        const rawSupply = mintData.readBigUInt64LE(36);
+        const ui = Number(rawSupply) / 10 ** decimals;
+        if (ui > 0) totalSupply = ui;
+      }
+      const abc = accs[1];
+      if (abc && abc.data.length >= 72) {
+        const raw = abc.data.readBigUInt64LE(64);
+        const decimals = mintData && mintData.length >= 45 ? mintData[44] : 6;
+        tokenAmount = Number(raw) / 10 ** decimals;
+      }
     } catch {
-      totalSupply = 0;
+      /* keep defaults */
     }
 
-    // En bonding curve, si aún no leemos ATA pero hay SOL, usar supply virtual restante
-    // (pump suele dejar ~1.073B tokens en curva al nacer) — mejor que fallar en 0
-    if (tokenAmount <= 0 && solAmount > 0 && totalSupply > 0) {
+    if (tokenAmount <= 0 && knownSol > 0) {
       tokenAmount = totalSupply;
     }
 
     return {
-      solAmount,
+      solAmount: knownSol,
       tokenAmount,
       totalSupply: totalSupply > 0 ? totalSupply : Math.max(tokenAmount, 1),
+      mintSafe,
     };
   }
 
-  /** Lee balances reales de vaults Raydium (no del AMM id). */
+  /** Raydium: 1 getMultipleAccounts (vaults + mint). knownSol del quick check. */
   private async fetchRaydiumVaultMetrics(
     coinVaultStr: string,
     pcVaultStr: string,
-    mint: PublicKey
+    mint: PublicKey,
+    knownSol: number
   ) {
     try {
       const coinVault = new PublicKey(coinVaultStr);
       const pcVault = new PublicKey(pcVaultStr);
+      const accs = await this.connection.getMultipleAccountsInfo([
+        coinVault,
+        pcVault,
+        mint,
+      ]);
 
-      const coinBalance = await this.connection.getTokenAccountBalance(coinVault);
-      const pcBalance = await this.connection.getTokenAccountBalance(pcVault);
-
-      const coinMint = coinBalance.value.uiAmount;
-      const pcAmount = pcBalance.value.uiAmount;
-
-      // Determinar cuál vault es WSOL vs token del proyecto
-      const coinInfo = await this.connection.getParsedAccountInfo(coinVault);
-      const pcInfo = await this.connection.getParsedAccountInfo(pcVault);
-      const coinMintStr =
-        (coinInfo.value?.data as { parsed?: { info?: { mint?: string } } })?.parsed?.info
-          ?.mint ?? '';
-      const pcMintStr =
-        (pcInfo.value?.data as { parsed?: { info?: { mint?: string } } })?.parsed?.info
-          ?.mint ?? '';
-
-      let solAmount = 0;
-      let tokenAmount = 0;
-
-      if (coinMintStr === WSOL) {
-        solAmount = coinMint ?? 0;
-        tokenAmount = pcAmount ?? 0;
-      } else if (pcMintStr === WSOL) {
-        solAmount = pcAmount ?? 0;
-        tokenAmount = coinMint ?? 0;
-      } else if (coinMintStr === mint.toBase58()) {
-        tokenAmount = coinMint ?? 0;
-        solAmount = pcAmount ?? 0;
-      } else {
-        tokenAmount = coinMint ?? 0;
-        solAmount = pcAmount ?? 0;
+      const mintData = accs[2]?.data;
+      const tokenDecimals = mintData && mintData.length >= 45 ? mintData[44] : 6;
+      let totalSupply = 1_000_000_000;
+      if (mintData && mintData.length >= 44) {
+        const ui = Number(mintData.readBigUInt64LE(36)) / 10 ** tokenDecimals;
+        if (ui > 0) totalSupply = ui;
       }
 
-      let totalSupply = 0;
-      try {
-        const supply = await this.connection.getTokenSupply(mint);
-        totalSupply = supply.value.uiAmount ?? 0;
-      } catch {
-        totalSupply = 0;
+      const coinMint =
+        accs[0] && accs[0].data.length >= 32
+          ? new PublicKey(accs[0].data.subarray(0, 32)).toBase58()
+          : '';
+      const pcMint =
+        accs[1] && accs[1].data.length >= 32
+          ? new PublicKey(accs[1].data.subarray(0, 32)).toBase58()
+          : '';
+
+      const coinUi = (decimals: number) =>
+        accs[0] && accs[0].data.length >= 72
+          ? Number(accs[0].data.readBigUInt64LE(64)) / 10 ** decimals
+          : 0;
+      const pcUi = (decimals: number) =>
+        accs[1] && accs[1].data.length >= 72
+          ? Number(accs[1].data.readBigUInt64LE(64)) / 10 ** decimals
+          : 0;
+
+      let solAmount = knownSol;
+      let tokenAmount = 0;
+
+      if (coinMint === WSOL) {
+        solAmount = coinUi(9);
+        tokenAmount = pcUi(tokenDecimals);
+      } else if (pcMint === WSOL) {
+        solAmount = pcUi(9);
+        tokenAmount = coinUi(tokenDecimals);
+      } else if (coinMint === mint.toBase58()) {
+        tokenAmount = coinUi(tokenDecimals);
+        solAmount = pcUi(9) || knownSol;
+      } else {
+        tokenAmount = coinUi(tokenDecimals);
+        solAmount = pcUi(9) || knownSol;
+      }
+
+      if (solAmount <= 0) solAmount = knownSol;
+
+      let mintSafe: boolean | undefined;
+      if (mintData && mintData.length >= 82) {
+        mintSafe =
+          mintData.readUInt32LE(0) === 0 && mintData.readUInt32LE(46) === 0;
       }
 
       return {
         solAmount,
         tokenAmount,
         totalSupply: totalSupply > 0 ? totalSupply : Math.max(tokenAmount, 1),
+        mintSafe,
       };
     } catch (e) {
       console.error('[RAYDIUM_VAULTS]', e);
-      return { solAmount: 0, tokenAmount: 0, totalSupply: 1 };
+      return { solAmount: knownSol, tokenAmount: 0, totalSupply: 1 };
     }
   }
 
@@ -359,18 +396,11 @@ export class BlockZeroScanner {
       wsolAmount = 0;
     }
 
-    let totalSupply = 0;
-    try {
-      const supply = await this.connection.getTokenSupply(mint);
-      totalSupply = supply.value.uiAmount ?? 0;
-    } catch {
-      totalSupply = 0;
-    }
-
     return {
       solAmount: Math.max(solAmount, wsolAmount),
       tokenAmount,
-      totalSupply: totalSupply > 0 ? totalSupply : Math.max(tokenAmount, 1),
+      totalSupply: Math.max(tokenAmount, 1_000_000_000),
+      mintSafe: undefined as boolean | undefined,
     };
   }
 
@@ -381,9 +411,11 @@ export class BlockZeroScanner {
   private async simulateChainedBuySell(tokenAddress: string): Promise<boolean> {
     try {
       const inputAmountLamports = Math.floor(0.1 * 1e9);
+      const { base, headers } = jupiterConfig();
 
       const buyQuoteRes = await fetch(
-        `https://quote-api.jup.ag/v6/quote?inputMint=${WSOL}&outputMint=${tokenAddress}&amount=${inputAmountLamports}&slippageBps=500`
+        `${base}/quote?inputMint=${WSOL}&outputMint=${tokenAddress}&amount=${inputAmountLamports}&slippageBps=500`,
+        { headers }
       );
       if (!buyQuoteRes.ok) return false;
       const buyQuote = (await buyQuoteRes.json()) as {
@@ -395,7 +427,8 @@ export class BlockZeroScanner {
       const expectedTokensOut = buyQuote.outAmount;
 
       const sellQuoteRes = await fetch(
-        `https://quote-api.jup.ag/v6/quote?inputMint=${tokenAddress}&outputMint=${WSOL}&amount=${expectedTokensOut}&slippageBps=500`
+        `${base}/quote?inputMint=${tokenAddress}&outputMint=${WSOL}&amount=${expectedTokensOut}&slippageBps=500`,
+        { headers }
       );
       if (!sellQuoteRes.ok) return false;
       const sellQuote = (await sellQuoteRes.json()) as {
@@ -452,23 +485,11 @@ export class BlockZeroScanner {
     }
   }
 
-  private async getRealSolPriceUSD(): Promise<number> {
-    try {
-      const res = await fetch(
-        'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd'
-      );
-      const data = (await res.json()) as { solana?: { usd?: number } };
-      return data.solana?.usd || 160.0;
-    } catch {
-      return 160.0;
-    }
-  }
-
   private async traceCabalFundingOnChain(deployer: PublicKey): Promise<boolean> {
     const sigs = await this.connection
-      .getSignaturesForAddress(deployer, { limit: 25 })
+      .getSignaturesForAddress(deployer, { limit: 8 })
       .catch(() => []);
     const twoHoursAgo = Date.now() / 1000 - 2 * 3600;
-    return sigs.filter((s) => (s.blockTime ?? 0) >= twoHoursAgo).length >= 20;
+    return sigs.filter((s) => (s.blockTime ?? 0) >= twoHoursAgo).length >= 7;
   }
 }

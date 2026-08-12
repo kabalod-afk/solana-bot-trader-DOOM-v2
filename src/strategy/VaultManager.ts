@@ -6,6 +6,7 @@ import {
   Transaction,
   sendAndConfirmTransaction,
 } from '@solana/web3.js';
+import { isLiveTrading } from '../core/jupiter';
 
 export class VaultManager {
   constructor(
@@ -14,18 +15,36 @@ export class VaultManager {
     private walletBPubkey: PublicKey
   ) {}
 
-  /** Cobertura TP: los SOL del swap parcial ya vuelven a Cartera A. */
+  public walletBBase58(): string {
+    return this.walletBPubkey.toBase58();
+  }
+
+  /**
+   * Cobertura TP: el partial sell ya deja SOL en A (capital de trabajo).
+   * No transfiere a B — el superávit neto va a B en sweepProfitsToVault al cerrar.
+   */
   async routeTakeProfitCoverage(amountUSD: number, solPriceUSD: number): Promise<boolean> {
     const solToReturn = amountUSD / solPriceUSD;
     console.log(
-      `[VAULT_REAL] Re-incorporando $${amountUSD} USD (${solToReturn.toFixed(4)} SOL) a Cartera A (${this.walletA.publicKey.toBase58()}).`
+      `[VAULT] Cobertura TP $${amountUSD} ≈ ${solToReturn.toFixed(4)} SOL queda en Cartera A (${this.walletA.publicKey.toBase58()}). Superávit al cierre → B (${this.walletBPubkey.toBase58()}).`
     );
     return true;
   }
 
-  /** lootSweeper: transfiere superávit neto a Cartera B. */
-  async sweepProfitsToVault(profitNetSOL: number): Promise<boolean> {
-    if (profitNetSOL <= 0) return false;
+  /**
+   * lootSweeper: transfiere PnL neto (lo producido) de A → Cartera B.
+   * Devuelve SOL realmente ruteados (0 si dry-run/sin saldo).
+   */
+  async sweepProfitsToVault(profitNetSOL: number): Promise<number> {
+    if (profitNetSOL <= 0) return 0;
+
+    const live = isLiveTrading();
+    if (!live) {
+      console.log(
+        `[VAULT_DRY] +${profitNetSOL.toFixed(4)} SOL → Cartera B (${this.walletBPubkey.toBase58()}) (no enviado, LIVE_TRADING=false)`
+      );
+      return 0;
+    }
 
     try {
       const lamportsToSweep = Math.floor(profitNetSOL * 1e9);
@@ -36,11 +55,11 @@ export class VaultManager {
 
       if (lamports <= 0) {
         console.warn('[VAULT_SWEEPER] Sin saldo transferible tras reserva de gas.');
-        return false;
+        return 0;
       }
 
       console.log(
-        `[VAULT_SWEEPER_REAL] Transfiriendo +${(lamports / 1e9).toFixed(4)} SOL a Cartera B (${this.walletBPubkey.toBase58()})...`
+        `[VAULT_SWEEPER] Transfiriendo +${(lamports / 1e9).toFixed(4)} SOL a Cartera B (${this.walletBPubkey.toBase58()})...`
       );
 
       const tx = new Transaction().add(
@@ -55,10 +74,10 @@ export class VaultManager {
         commitment: 'confirmed',
       });
       console.log(`[VAULT_SWEEPER_CONFIRMED] Firma: ${sig}`);
-      return true;
+      return lamports / 1e9;
     } catch (e) {
       console.error('[VAULT_SWEEPER_ERROR] Error transfiriendo a Vault B:', e);
-      return false;
+      return 0;
     }
   }
 }

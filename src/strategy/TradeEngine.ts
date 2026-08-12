@@ -13,6 +13,7 @@ export class TradeEngine {
   private hasTakenProfit = false;
   private entryTimeMs = Date.now();
   private forceCloseRequested = false;
+  private lastVaultedSol = 0;
 
   constructor(
     private instanceBotId: string,
@@ -59,10 +60,10 @@ export class TradeEngine {
 
     if (this.forceCloseRequested) {
       const sell = await this.jito.executeFullSell(this.tokenAddress);
+      if (!sell.ok) return this.abortClose('cierre forzado');
       const pnl =
         (metrics.currentPriceUSD / this.entryPriceUSD - 1) * this.currentSolExposed;
-      const vaultSweep = Math.max(0, pnl);
-      if (vaultSweep > 0) await this.vault.sweepProfitsToVault(vaultSweep);
+      await this.vaultProfit(pnl);
       this.helios.updateAfterTrade(
         pnl,
         this.observationTimeMs,
@@ -76,6 +77,7 @@ export class TradeEngine {
     // 1. RUG PULL
     if (metrics.isDevSelling) {
       const sell = await this.jito.executeEmergencyEvacuation(this.tokenAddress);
+      if (!sell.ok) return this.abortClose('rug');
       void this.telegram.sendText(
         `🚨 *[${this.instanceBotId}] RUG PULL EN MEMPOOL.* Evacuado vía Jito.`
       );
@@ -98,10 +100,11 @@ export class TradeEngine {
     // 2. TECHO DE MILLONES
     if (metrics.mcUSD >= 8_000_000) {
       const sell = await this.jito.executeFullSell(this.tokenAddress);
+      if (!sell.ok) return this.abortClose('techo MC');
       const netProfit =
         (metrics.currentPriceUSD / this.entryPriceUSD - 1) * this.currentSolExposed;
 
-      if (netProfit > 0) await this.vault.sweepProfitsToVault(netProfit);
+      await this.vaultProfit(netProfit);
       this.helios.updateAfterTrade(
         netProfit,
         this.observationTimeMs,
@@ -117,11 +120,10 @@ export class TradeEngine {
       (this.highestPriceUSD - metrics.currentPriceUSD) / this.highestPriceUSD;
     if (dropFromPeak >= 0.3) {
       const sell = await this.jito.executeFullSell(this.tokenAddress);
+      if (!sell.ok) return this.abortClose('trailing');
       const pnl =
         (metrics.currentPriceUSD / this.entryPriceUSD - 1) * this.currentSolExposed;
-      const vaultSweep = Math.max(0, pnl);
-
-      if (vaultSweep > 0) await this.vault.sweepProfitsToVault(vaultSweep);
+      await this.vaultProfit(pnl);
 
       this.helios.updateAfterTrade(
         pnl,
@@ -134,7 +136,7 @@ export class TradeEngine {
     }
 
     // 4. DESESCALADA
-    const deriskSensitivity = this.helios.brain.learned_weights.derisk_sensitivity;
+    const deriskSensitivity = this.helios.weights().derisk_sensitivity;
     const isBuyingFatigue =
       metrics.buyVolumeRatio >= 0.4 && metrics.buyVolumeRatio <= 0.48;
     const isConsecutiveSells = metrics.consecutiveSells >= 3;
@@ -222,14 +224,11 @@ export class TradeEngine {
     // 7. MONOTONÍA
     const elapsedTime = Date.now() - this.entryTimeMs;
     const priceVar = Math.abs(currentMult - 1.0);
-    if (
-      elapsedTime > 240_000 &&
-      priceVar < 0.05 &&
-      metrics.txPerMinute < 10 &&
-      !this.hasTakenProfit
-    ) {
+    if (elapsedTime > 240_000 && priceVar < 0.05 && !this.hasTakenProfit) {
       const sell = await this.jito.executeFullSell(this.tokenAddress);
+      if (!sell.ok) return this.abortClose('estancamiento');
       const pnl = (currentMult - 1) * this.currentSolExposed;
+      await this.vaultProfit(pnl);
 
       this.helios.updateAfterTrade(
         pnl,
@@ -245,6 +244,19 @@ export class TradeEngine {
     return 'RUNNING';
   }
 
+  private abortClose(reason: string): 'RUNNING' {
+    console.error(
+      `[CLOSE_ABORT] ${this.instanceBotId} venta no confirmada (${reason}) — se reintenta, no se rutea a B`
+    );
+    return 'RUNNING';
+  }
+
+  /** PnL positivo → lootSweeper A→B. Pérdidas no tocan el vault. */
+  private async vaultProfit(pnlSol: number): Promise<void> {
+    const surplus = Math.max(0, pnlSol);
+    this.lastVaultedSol = surplus > 0 ? await this.vault.sweepProfitsToVault(surplus) : 0;
+  }
+
   private async reportClose(reason: string, pnlSol: number, txHash: string): Promise<void> {
     const durationSec = Math.max(0, Math.round((Date.now() - this.entryTimeMs) / 1000));
     const pnlPercent =
@@ -255,7 +267,10 @@ export class TradeEngine {
       pnlSol,
       pnlPercent,
       durationSec,
-      txHash
+      txHash,
+      undefined,
+      this.vault.walletBBase58(),
+      this.lastVaultedSol
     );
   }
 }

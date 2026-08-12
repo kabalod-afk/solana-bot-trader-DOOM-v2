@@ -9,7 +9,9 @@ export class TelegramService {
     token: string,
     private chatId: string
   ) {
-    this.bot = new TelegramBot(token, { polling: true });
+    this.bot = new TelegramBot(token, {
+      polling: { interval: 2000, params: { timeout: 30 } },
+    });
     this.listenCommands();
   }
 
@@ -151,13 +153,23 @@ export class TelegramService {
     pnlPercent: number,
     durationSec: number,
     txHash: string,
-    symbol?: string
+    symbol?: string,
+    vaultB?: string,
+    vaultedSol?: number
   ): Promise<void> {
     const icon = pnlSol >= 0 ? '🟢' : '🔴';
     const hash = this.esc(txHash || '');
     const link = txHash
       ? `<a href="https://solscan.io/tx/${hash}">Ver en Solscan</a>`
       : 'n/d';
+    const vaultLine =
+      vaultB && (vaultedSol ?? 0) > 0
+        ? `\n• <b>Ruteo a Cartera B:</b> +${(vaultedSol ?? 0).toFixed(3)} SOL → <code>${this.esc(vaultB)}</code>`
+        : vaultB && pnlSol > 0
+          ? `\n• <b>Cartera B (vault):</b> <code>${this.esc(vaultB)}</code> (PnL no ruteado: dry-run o sin saldo)`
+          : vaultB
+            ? `\n• <b>Cartera B (vault):</b> <code>${this.esc(vaultB)}</code> (sin superávit)`
+            : '';
     const msg =
       `🏁 <b>[TRADE CLOSED] Operación Finalizada</b>\n\n` +
       `• <b>Token:</b> $${this.ticker(mint, symbol)}\n` +
@@ -165,7 +177,8 @@ export class TelegramService {
       `<b>📊 Informe de Operación:</b>\n` +
       `├─ <b>Tiempo Transcurrido:</b> ${durationSec}s\n` +
       `└─ <b>PnL Neto:</b> ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(3)} SOL (${pnlPercent.toFixed(1)}%) ${icon}\n\n` +
-      `• <b>Tx Venta:</b> ${link}`;
+      `• <b>Tx Venta:</b> ${link}` +
+      vaultLine;
     await this.sendHtml(msg);
   }
 

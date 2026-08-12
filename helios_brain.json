@@ -3,8 +3,14 @@
   "learned_weights": {
     "min_observation_window_ms": 10000,
     "min_pool_sol_threshold": 5.0,
-    "ideal_buy_ratio": 0.60,
-    "derisk_sensitivity": 0.30
+    "ideal_buy_ratio": 0.6,
+    "derisk_sensitivity": 0.3,
+    "volume_burst_sol": 1.5,
+    "log_burst_buys": 8,
+    "organic_mc_multiplier": 1.8,
+    "min_unique_wallets": 5,
+    "serial_deploys_per_2h": 8,
+    "skip_after_rejects": 4
   },
   "cabal_patterns": {
     "blacklisted_funding_wallets": [],
@@ -14,5 +20,8 @@
     "total_trades": 0,
     "win_rate": 0.0,
     "average_pnl_sol": 0.0
+  },
+  "analysis_memory": {
+    "deployers": {}
   }
 }

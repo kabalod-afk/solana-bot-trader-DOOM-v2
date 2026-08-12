@@ -315,8 +315,9 @@ export class PoolListener {
 
     try {
       let tx = await fetchTx();
+      // processed WS vs confirmed getTx: 1 reintento corto si aún no indexó
       if (!tx?.transaction) {
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r) => setTimeout(r, 400));
         tx = await fetchTx();
       }
       if (!tx?.transaction) return null;

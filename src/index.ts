@@ -11,9 +11,11 @@ import { VaultManager } from './strategy/VaultManager';
 import { TelegramService } from './services/TelegramService';
 import { TradeEngine } from './strategy/TradeEngine';
 import { NewPoolEvent, PoolListener } from './blockchain/PoolListener';
-import { fetchRealPoolTick } from './blockchain/poolTick';
+import { fetchRealPoolTick, rememberPoolSupply, PoolTickOpts } from './blockchain/poolTick';
 import { loadWalletA } from './core/loadWalletA';
 import { loadMomentumConfig } from './core/momentumConfig';
+import { getCachedSolPrice, refreshSolPrice } from './core/solPriceCache';
+import { isLiveTrading } from './core/jupiter';
 
 function requireEnv(key: string): string {
   const value = process.env[key];
@@ -31,6 +33,7 @@ interface ActivePosition {
   pool: string;
   interval: ReturnType<typeof setInterval>;
   tickLock: boolean;
+  tickOpts?: PoolTickOpts;
 }
 
 async function bootstrap(): Promise<void> {
@@ -43,11 +46,12 @@ async function bootstrap(): Promise<void> {
   const telegramToken = requireEnv('TELEGRAM_BOT_TOKEN');
   const telegramChatId = requireEnv('TELEGRAM_CHAT_ID');
   const jitoUrl = process.env.JITO_ENGINE_URL;
-  const liveTrading = process.env.LIVE_TRADING === 'true';
+  const liveTrading = isLiveTrading();
 
   const connection = new Connection(rpcUrl, {
     commitment: 'confirmed',
     wsEndpoint: wssUrl,
+    disableRetryOnRateLimit: true,
   });
 
   const loaded = loadWalletA();
@@ -64,9 +68,11 @@ async function bootstrap(): Promise<void> {
     throw new Error('Cartera A y Cartera B no pueden ser la misma dirección.');
   }
 
+  const walletBStr = walletBPubkey.toBase58();
   console.log(
-    `🔑 Cartera A: ${derivedA} (fuente: ${loaded.source}${loaded.path ? ` ${loaded.path}` : ''})`
+    `🔑 Cartera A (trabajo): ${derivedA} (fuente: ${loaded.source}${loaded.path ? ` ${loaded.path}` : ''})`
   );
+  console.log(`🏦 Cartera B (vault):    ${walletBStr}`);
 
   const helios = new HeliosEngine();
   const scheduler = new MemoryScheduler();
@@ -80,21 +86,13 @@ async function bootstrap(): Promise<void> {
   const inflightTokens = new Set<string>();
   const activeEnginesList: ActivePosition[] = [];
   let opCounter = 1;
-  let solPriceUSD = 160;
-
-  const refreshSolPrice = async () => {
-    try {
-      const res = await fetch(
-        'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd'
-      );
-      const data = (await res.json()) as { solana?: { usd?: number } };
-      if (data.solana?.usd) solPriceUSD = data.solana.usd;
-    } catch {
-      /* keep */
-    }
-  };
-  await refreshSolPrice();
-  setInterval(() => void refreshSolPrice(), 60_000);
+  await refreshSolPrice(true);
+  let solPriceUSD = getCachedSolPrice();
+  setInterval(() => {
+    void refreshSolPrice().then(() => {
+      solPriceUSD = getCachedSolPrice();
+    });
+  }, 5 * 60_000);
 
   telegram.registerForceCloseHandler(async () => {
     const snapshot = [...activeEnginesList];
@@ -104,7 +102,8 @@ async function bootstrap(): Promise<void> {
         connection,
         item.pool,
         item.token,
-        solPriceUSD
+        solPriceUSD,
+        item.tickOpts
       ).catch(() => null);
       await item.engine.processTick({
         currentPriceUSD: tick?.currentPriceUSD || 0.0001,
@@ -123,19 +122,38 @@ async function bootstrap(): Promise<void> {
   });
 
   const momentum = loadMomentumConfig(helios.brain.learned_weights.min_pool_sol_threshold);
-  console.log(`✅ Cartera A: ${walletA.publicKey.toBase58()}`);
+  const hw = helios.weights();
   console.log(
     `Helios ${helios.brain.version} | LIVE_TRADING=${liveTrading} | SOL≈$${solPriceUSD}`
   );
   console.log(
     `Momentum: pool≥${momentum.minPoolSol} SOL | MC $${momentum.minMcUSD}-$${momentum.maxMcUSD} | minTx=${momentum.minTxCount}`
   );
+  console.log(
+    `Helios JSON: ventana≥${hw.min_observation_window_ms}ms buy≥${hw.ideal_buy_ratio} burstLogs=${hw.log_burst_buys} serial/2h=${hw.serial_deploys_per_2h}`
+  );
+
+  const flushHelios = () => {
+    try {
+      helios.saveBrain();
+    } catch {
+      /* ignore */
+    }
+  };
+  process.on('SIGINT', () => {
+    flushHelios();
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    flushHelios();
+    process.exit(0);
+  });
   if (!liveTrading) {
     console.log('🧪 DRY-RUN: Helius → B0 (LP burn + sim) → ventana 0-45s; sin compras.');
   }
 
   await telegram.sendText(
-    `🟢 *DOOM v2 ONLINE*\n• Modo: ${liveTrading ? 'LIVE' : 'DRY-RUN'}\n• Feed: Helius WS (parser Raydium/Pump exacto)\n• Cartera A: \`${walletA.publicKey.toBase58()}\``
+    `🟢 *DOOM v2 ONLINE*\n• Modo: ${liveTrading ? 'LIVE' : 'DRY-RUN'}\n• Feed: Helius WS (parser Raydium/Pump exacto)\n• Cartera A (trabajo): \`${derivedA}\`\n• Cartera B (vault): \`${walletBStr}\``
   );
 
   /**
@@ -149,7 +167,13 @@ async function bootstrap(): Promise<void> {
     if (telegram.isPaused()) return;
     if (activeTokensSet.has(token) || inflightTokens.has(token)) return;
     if (!scheduler.canSpawnThread()) return;
-    if (helios.isBlacklisted(event.deployerAddress)) return;
+
+    helios.noteSeen(event.deployerAddress);
+    const heliosSkip = helios.shouldSkipAnalysis(event.deployerAddress);
+    if (heliosSkip) {
+      console.log(`[HELIOS_SKIP] ${token}: ${heliosSkip.reason}`);
+      return;
+    }
 
     inflightTokens.add(token);
 
@@ -169,6 +193,7 @@ async function bootstrap(): Promise<void> {
 
       if (!b0Result.passed) {
         console.log(`[B0_REJECT] ${token}: ${b0Result.reason}`);
+        helios.noteReject(event.deployerAddress, b0Result.reason ?? 'B0 reject');
         void telegram.notifyBlockZeroReject(token, b0Result.reason ?? '');
         inflightTokens.delete(token);
         return;
@@ -184,7 +209,7 @@ async function bootstrap(): Promise<void> {
 
   const continueAfterBlockZero = async (
     event: NewPoolEvent,
-    b0Result: { initialMcUSD: number; initialPoolSol: number }
+    b0Result: { initialMcUSD: number; initialPoolSol: number; totalSupply?: number }
   ): Promise<void> => {
     const token = event.tokenAddress;
 
@@ -208,11 +233,19 @@ async function bootstrap(): Promise<void> {
         event.poolAddress,
         b0Result.initialPoolSol,
         event.deployerAddress,
-        b0Result.initialMcUSD
+        b0Result.initialMcUSD,
+        {
+          solAccount:
+            event.source === 'raydium' && event.pcVault
+              ? event.pcVault
+              : event.poolAddress,
+          isTokenAccount: event.source === 'raydium' && !!event.pcVault,
+        }
       );
 
       if (!obsResult.passed) {
         console.log(`[WINDOW_REJECT] ${token}: ${obsResult.reason}`);
+        helios.noteWindowOutcome(event.deployerAddress, false, obsResult.reason);
         activeTokensSet.delete(token);
         scheduler.releaseThread();
         return;
@@ -224,19 +257,19 @@ async function bootstrap(): Promise<void> {
         );
       }
 
-      const balanceLamports = await connection.getBalance(walletA.publicKey);
-      if (balanceLamports / 1e9 < obsResult.entrySizeSol + 0.05) {
-        console.log(
-          `[CAPITAL] ${botInstanceId}: insuficiente para ${obsResult.entrySizeSol} SOL + gas`
+      if (!liveTrading) {
+        await telegram.sendText(
+          `🤖 *[${botInstanceId}] DRY-RUN OK:* \`${token.slice(0, 8)}…\` pasó B0+ventana (${obsResult.observationTimeMs}ms, buy=${(obsResult.buyVolumeRatio * 100).toFixed(0)}%). Sin compra.`
         );
         activeTokensSet.delete(token);
         scheduler.releaseThread();
         return;
       }
 
-      if (!liveTrading) {
-        await telegram.sendText(
-          `🤖 *[${botInstanceId}] DRY-RUN OK:* \`${token.slice(0, 8)}…\` pasó B0+ventana (${obsResult.observationTimeMs}ms, buy=${(obsResult.buyVolumeRatio * 100).toFixed(0)}%). Sin compra.`
+      const balanceLamports = await connection.getBalance(walletA.publicKey);
+      if (balanceLamports / 1e9 < obsResult.entrySizeSol + 0.05) {
+        console.log(
+          `[CAPITAL] ${botInstanceId}: insuficiente para ${obsResult.entrySizeSol} SOL + gas`
         );
         activeTokensSet.delete(token);
         scheduler.releaseThread();
@@ -250,12 +283,21 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
+      if (b0Result.totalSupply) {
+        rememberPoolSupply(event.poolAddress, b0Result.totalSupply);
+      }
+      const tickOpts: PoolTickOpts = {
+        coinVault: event.coinVault,
+        pcVault: event.pcVault,
+        associatedBondingCurve: event.associatedBondingCurve,
+        totalSupplyHint: b0Result.totalSupply,
+      };
       const entryTick = await fetchRealPoolTick(
         connection,
         event.poolAddress,
         token,
         solPriceUSD,
-        { coinVault: event.coinVault, pcVault: event.pcVault }
+        tickOpts
       );
       const entryPrice = entryTick.currentPriceUSD || 0.0001;
       const opNum = opCounter++;
@@ -287,11 +329,10 @@ async function bootstrap(): Promise<void> {
         pool: event.poolAddress,
         interval: null as unknown as ReturnType<typeof setInterval>,
         tickLock: false,
+        tickOpts,
       };
 
       const lastBuyRatio = obsResult.buyVolumeRatio;
-      const coinVault = event.coinVault;
-      const pcVault = event.pcVault;
 
       position.interval = setInterval(() => {
         void (async () => {
@@ -303,7 +344,7 @@ async function bootstrap(): Promise<void> {
               event.poolAddress,
               token,
               solPriceUSD,
-              { coinVault, pcVault }
+              tickOpts
             );
             if (tick.currentPriceUSD <= 0) return;
 
@@ -330,7 +371,7 @@ async function bootstrap(): Promise<void> {
             position.tickLock = false;
           }
         })();
-      }, 1000);
+      }, 4_000);
 
       activeEnginesList.push(position);
     } catch (err) {
@@ -354,7 +395,7 @@ async function bootstrap(): Promise<void> {
   poolListener.start();
 
   console.log(
-    '📡 PoolListener activo — ranura única getTx→B0 (máx 2); ventana async tras liberar.'
+    '📡 PoolListener activo — 1 getTx→B0 a la vez; ventana async; ticks 4s.'
   );
 }
 

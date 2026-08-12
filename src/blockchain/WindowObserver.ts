@@ -2,6 +2,11 @@ import { Connection, PublicKey, LogsCallback } from '@solana/web3.js';
 import { HeliosEngine } from '../core/HeliosEngine';
 import { loadMomentumConfig } from '../core/momentumConfig';
 
+export interface WindowSolWatch {
+  solAccount: string;
+  isTokenAccount: boolean;
+}
+
 export interface ObservationResult {
   passed: boolean;
   reason?: string;
@@ -24,6 +29,7 @@ export interface TokenTrackingState {
   currentMcUsd: number;
   txHistory: TxTick[];
   uniqueWallets: Set<string>;
+  buyTimestamps: number[];
 }
 
 interface LiveTicks {
@@ -35,6 +41,7 @@ interface LiveTicks {
   volumeSolIn: number;
   wallets: string[];
   currentPoolSol: number;
+  didRpc: boolean;
 }
 
 const WALLET_RE = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g;
@@ -46,30 +53,41 @@ export class WindowObserver {
   ) {}
 
   /**
-   * Evaluación dinámica de momentum (ráfaga 15s / impulso orgánico MC×wallets).
+   * Momentum desde pesos Helios (JSON): ráfaga de logs, ráfaga SOL, impulso MC.
    */
   public evaluateMomentum(tokenData: TokenTrackingState): boolean {
-    const { initialMcUsd, currentMcUsd, txHistory, uniqueWallets } = tokenData;
+    const { initialMcUsd, currentMcUsd, txHistory, uniqueWallets, buyTimestamps } =
+      tokenData;
+    const w = this.helios.weights();
     const now = Date.now();
 
-    // 1. Condición de Ráfaga de Volumen (últimos 15 segundos)
-    const recentVolumeSol = txHistory
-      .filter((tx) => now - tx.timestamp <= 15_000)
-      .reduce((sum, tx) => sum + tx.amountSol, 0);
-
-    if (recentVolumeSol >= 1.5) {
+    const recentBuys = buyTimestamps.filter((t) => now - t <= 15_000).length;
+    if (recentBuys >= w.log_burst_buys) {
       console.log(
-        `[TRIGGER] Ráfaga de volumen detectada: +${recentVolumeSol.toFixed(2)} SOL en 15s`
+        `[TRIGGER] Helios JSON: ráfaga de logs ${recentBuys} buys / 15s (umbral ${w.log_burst_buys})`
       );
       return true;
     }
 
-    // 2. Condición por Multiplicador y Compradores Únicos
+    const recentVolumeSol = txHistory
+      .filter((tx) => now - tx.timestamp <= 15_000)
+      .reduce((sum, tx) => sum + tx.amountSol, 0);
+
+    if (recentVolumeSol >= w.volume_burst_sol) {
+      console.log(
+        `[TRIGGER] Helios JSON: ráfaga +${recentVolumeSol.toFixed(2)} SOL en 15s (umbral ${w.volume_burst_sol})`
+      );
+      return true;
+    }
+
     if (initialMcUsd > 0) {
       const mcMultiplier = currentMcUsd / initialMcUsd;
-      if (mcMultiplier >= 1.8 && uniqueWallets.size >= 5) {
+      if (
+        mcMultiplier >= w.organic_mc_multiplier &&
+        uniqueWallets.size >= w.min_unique_wallets
+      ) {
         console.log(
-          `[TRIGGER] Impulso orgánico: ${mcMultiplier.toFixed(2)}x MC con ${uniqueWallets.size} wallets`
+          `[TRIGGER] Helios JSON: impulso ${mcMultiplier.toFixed(2)}x MC con ${uniqueWallets.size} wallets`
         );
         return true;
       }
@@ -82,14 +100,15 @@ export class WindowObserver {
     poolAddress: string,
     initialPoolSol: number,
     deployerAddress?: string,
-    initialMcUsd = 0
+    initialMcUsd = 0,
+    solWatch?: WindowSolWatch
   ): Promise<ObservationResult> {
     const startTime = Date.now();
     const MAX_WINDOW_MS = 45_000;
-    const minWindowMs = this.helios.brain.learned_weights.min_observation_window_ms;
-    const { minTxCount } = loadMomentumConfig(
-      this.helios.brain.learned_weights.min_pool_sol_threshold
-    );
+    const w = this.helios.weights();
+    const minWindowMs = w.min_observation_window_ms;
+    const { minTxCount } = loadMomentumConfig(w.min_pool_sol_threshold);
+    const highConvictionPool = w.min_pool_sol_threshold * 3;
 
     let thirdPartySells = 0;
     let totalBuys = 0;
@@ -102,6 +121,7 @@ export class WindowObserver {
       currentMcUsd: initialMcUsd,
       txHistory: [],
       uniqueWallets: new Set<string>(),
+      buyTimestamps: [],
     };
 
     let pool: PublicKey;
@@ -119,6 +139,7 @@ export class WindowObserver {
     }
 
     const logBuffer: string[] = [];
+    let lastSolRpcAt = 0;
     const onLogs: LogsCallback = (logs) => {
       if (logs.err) return;
       for (const line of logs.logs) {
@@ -130,13 +151,24 @@ export class WindowObserver {
 
     try {
       while (Date.now() - startTime < MAX_WINDOW_MS) {
+        const elapsedPre = Date.now() - startTime;
+        const hasSellHint = logBuffer.some((line) =>
+          /sell|remove|withdraw|close/i.test(line)
+        );
+        // RPC solo tras ventana mínima Helios, o si los logs piden validar drain
+        const forceRpc =
+          (elapsedPre >= minWindowMs && Date.now() - lastSolRpcAt >= 6_000) ||
+          hasSellHint;
         const ticks = await this.consumeTicks(
           pool,
           logBuffer,
           deployerAddress,
           initialPoolSol,
-          lastPoolSol
+          lastPoolSol,
+          forceRpc,
+          solWatch
         );
+        if (ticks.didRpc) lastSolRpcAt = Date.now();
         logBuffer.length = 0;
 
         totalBuys += ticks.buys;
@@ -149,6 +181,10 @@ export class WindowObserver {
             timestamp: Date.now(),
             amountSol: ticks.volumeSolIn,
           });
+        }
+        if (ticks.buys > 0) {
+          const nowTs = Date.now();
+          for (let i = 0; i < ticks.buys; i++) tracking.buyTimestamps.push(nowTs);
         }
         for (const w of ticks.wallets) {
           if (w !== deployerAddress && w !== poolAddress) {
@@ -182,10 +218,14 @@ export class WindowObserver {
         // Momentum dinámico (ráfaga / impulso) — puede disparar antes del checklist Helios
         if (elapsedTime >= 5_000 && this.evaluateMomentum(tracking)) {
           const isBurst =
+            tracking.buyTimestamps.filter((t) => Date.now() - t <= 15_000).length >=
+              w.log_burst_buys ||
             tracking.txHistory
               .filter((tx) => Date.now() - tx.timestamp <= 15_000)
-              .reduce((s, tx) => s + tx.amountSol, 0) >= 1.5;
-          const isHighConviction = buyRatio >= 0.8 && initialPoolSol >= 15.0;
+              .reduce((s, tx) => s + tx.amountSol, 0) >= w.volume_burst_sol;
+          const isHighConviction =
+            buyRatio >= Math.max(0.8, w.ideal_buy_ratio) &&
+            initialPoolSol >= highConvictionPool;
           return {
             passed: true,
             entrySizeSol: isHighConviction ? 1.5 : 1.0,
@@ -197,7 +237,7 @@ export class WindowObserver {
           };
         }
 
-        const minRatio = this.helios.brain.learned_weights.ideal_buy_ratio;
+        const minRatio = w.ideal_buy_ratio;
         if (
           elapsedTime >= minWindowMs &&
           thirdPartySells >= 1 &&
@@ -205,7 +245,9 @@ export class WindowObserver {
           isLpSecured &&
           totalTx >= minTxCount
         ) {
-          const isHighConviction = buyRatio >= 0.8 && initialPoolSol >= 15.0;
+          const isHighConviction =
+            buyRatio >= Math.max(0.8, w.ideal_buy_ratio) &&
+            initialPoolSol >= highConvictionPool;
           return {
             passed: true,
             entrySizeSol: isHighConviction ? 1.5 : 1.0,
@@ -217,7 +259,7 @@ export class WindowObserver {
           };
         }
 
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r) => setTimeout(r, 2_000));
       }
     } finally {
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
@@ -239,7 +281,9 @@ export class WindowObserver {
     logBuffer: string[],
     deployerAddress: string | undefined,
     initialPoolSol: number,
-    lastPoolSol: number
+    lastPoolSol: number,
+    forceRpc: boolean,
+    solWatch?: WindowSolWatch
   ): Promise<LiveTicks> {
     let buys = 0;
     let sells = 0;
@@ -249,7 +293,15 @@ export class WindowObserver {
 
     for (const line of logBuffer) {
       const lower = line.toLowerCase();
-      if (lower.includes('sell') || lower.includes('swap')) {
+      if (lower.includes('instruction: buy') || lower.includes('instruction:buy')) {
+        buys++;
+      } else if (
+        lower.includes('instruction: sell') ||
+        lower.includes('instruction:sell')
+      ) {
+        sells++;
+        hasThirdPartySell = true;
+      } else if (lower.includes('sell') || lower.includes('swap')) {
         if (lower.includes('sell') || lower.includes('amount_in')) {
           sells++;
           hasThirdPartySell = true;
@@ -268,8 +320,22 @@ export class WindowObserver {
       }
     }
 
-    const currentLamports = await this.connection.getBalance(pool).catch(() => 0);
-    const currentPoolSol = currentLamports / 1e9;
+    // Sin logs nuevos: no gastar getBalance (reusa último SOL conocido)
+    if (!forceRpc && buys + sells === 0 && logBuffer.length === 0) {
+      return {
+        buys: 0,
+        sells: 0,
+        hasThirdPartySell: false,
+        isDevSelling: false,
+        lpDrained: false,
+        volumeSolIn: 0,
+        wallets,
+        currentPoolSol: lastPoolSol,
+        didRpc: false,
+      };
+    }
+
+    const currentPoolSol = await this.readPoolSol(pool, solWatch);
     const lpDrained = initialPoolSol > 0 && currentPoolSol < initialPoolSol * 0.9;
     const volumeSolIn = Math.max(0, currentPoolSol - lastPoolSol);
 
@@ -283,6 +349,7 @@ export class WindowObserver {
         volumeSolIn: 0,
         wallets,
         currentPoolSol,
+        didRpc: true,
       };
     }
 
@@ -300,6 +367,27 @@ export class WindowObserver {
       volumeSolIn,
       wallets,
       currentPoolSol,
+      didRpc: true,
     };
+  }
+
+  private async readPoolSol(
+    pool: PublicKey,
+    solWatch?: WindowSolWatch
+  ): Promise<number> {
+    try {
+      if (solWatch?.isTokenAccount) {
+        const bal = await this.connection.getTokenAccountBalance(
+          new PublicKey(solWatch.solAccount)
+        );
+        return bal.value.uiAmount ?? 0;
+      }
+      const target = solWatch?.solAccount
+        ? new PublicKey(solWatch.solAccount)
+        : pool;
+      return (await this.connection.getBalance(target).catch(() => 0)) / 1e9;
+    } catch {
+      return (await this.connection.getBalance(pool).catch(() => 0)) / 1e9;
+    }
   }
 }

@@ -8,6 +8,7 @@ import {
   ComputeBudgetProgram,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { jupiterConfig } from '../core/jupiter';
 
 export interface ExecResult {
   ok: boolean;
@@ -164,17 +165,18 @@ export class JitoExecution {
 
       if (amountRaw <= 0) return null;
 
+      const { base, headers } = jupiterConfig();
       const quoteUrl =
-        `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}` +
+        `${base}/quote?inputMint=${inputMint}` +
         `&outputMint=${outputMint}&amount=${amountRaw}&slippageBps=300`;
 
-      const quoteRes = await fetch(quoteUrl);
+      const quoteRes = await fetch(quoteUrl, { headers });
       if (!quoteRes.ok) return null;
       const quote = await quoteRes.json();
 
-      const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
+      const swapRes = await fetch(`${base}/swap`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           quoteResponse: quote,
           userPublicKey: this.walletA.publicKey.toBase58(),
@@ -244,7 +246,7 @@ export class JitoExecution {
         jsonrpc: '2.0',
         id: 1,
         method: 'sendBundle',
-        params: [[b64Swap, b64Tip]],
+        params: [[b64Swap, b64Tip], { encoding: 'base64' }],
       }),
     }).catch((err) => {
       console.error('[JITO_BUNDLE] fetch error:', err);
