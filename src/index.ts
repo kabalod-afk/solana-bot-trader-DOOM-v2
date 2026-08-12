@@ -10,7 +10,7 @@ import { JitoExecution } from './blockchain/JitoExecution';
 import { VaultManager } from './strategy/VaultManager';
 import { TelegramService } from './services/TelegramService';
 import { TradeEngine } from './strategy/TradeEngine';
-import { NewPoolEvent, PoolListener } from './blockchain/PoolListener';
+import { NewPoolEvent, PoolListener, redactWssUrl, normalizeHeliusWssUrl } from './blockchain/PoolListener';
 import { fetchRealPoolTick, rememberPoolSupply, PoolTickOpts } from './blockchain/poolTick';
 import { loadWalletA } from './core/loadWalletA';
 import { loadMomentumConfig } from './core/momentumConfig';
@@ -40,13 +40,19 @@ async function bootstrap(): Promise<void> {
   console.log('🚀 INICIANDO MOTOR DOOM v2 EN MAINNET...');
 
   const rpcUrl = requireEnv('SOLANA_RPC_URL');
-  const wssUrl = requireEnv('SOLANA_WSS_URL');
+  const wssUrl = normalizeHeliusWssUrl(requireEnv('SOLANA_WSS_URL'));
   const walletAPubkeyEnv = requireEnv('WALLETA_PUBKEY');
   const walletBPubkey = new PublicKey(requireEnv('WALLETB_PUBKEY'));
   const telegramToken = requireEnv('TELEGRAM_BOT_TOKEN');
   const telegramChatId = requireEnv('TELEGRAM_CHAT_ID');
   const jitoUrl = process.env.JITO_ENGINE_URL;
   const liveTrading = isLiveTrading();
+
+  console.log(`RPC:  ${rpcUrl.replace(/api-key=[^&\s]+/gi, 'api-key=***')}`);
+  console.log(`WSS:  ${redactWssUrl(wssUrl)}`);
+  if (!/api-key=/i.test(wssUrl)) {
+    console.warn('⚠️ SOLANA_WSS_URL sin api-key= — Helius suele exigirla en el query string.');
+  }
 
   const connection = new Connection(rpcUrl, {
     commitment: 'confirmed',

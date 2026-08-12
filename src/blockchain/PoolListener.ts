@@ -165,6 +165,24 @@ export function extractAccountKeysFromTx(tx: {
   return [];
 }
 
+/** Evita https:// y espacios; fuerza wss. */
+export function normalizeHeliusWssUrl(raw: string): string {
+  let u = raw.trim();
+  if (u.startsWith('https://')) u = `wss://${u.slice('https://'.length)}`;
+  if (u.startsWith('http://')) u = `ws://${u.slice('http://'.length)}`;
+  return u;
+}
+
+export function redactWssUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.searchParams.has('api-key')) u.searchParams.set('api-key', '***');
+    return `${u.protocol}//${u.host}${u.pathname}${u.search}`;
+  } catch {
+    return url.replace(/api-key=[^&\s]+/gi, 'api-key=***');
+  }
+}
+
 export class PoolListener {
   private ws: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -172,6 +190,9 @@ export class PoolListener {
   private seenSignatures = new Set<string>();
   private subId = 1;
   private reconnectAttempt = 0;
+  private connecting = false;
+  private lastErrorWas522 = false;
+  private readonly safeEndpoint: string;
 
   constructor(
     private wssUrl: string,
@@ -180,10 +201,14 @@ export class PoolListener {
     /** false → descarta antes de getTransaction (máx. concurrencia RPC). */
     private tryAcquireRpc?: () => boolean,
     private releaseRpc?: () => void
-  ) {}
+  ) {
+    this.wssUrl = normalizeHeliusWssUrl(wssUrl);
+    this.safeEndpoint = redactWssUrl(this.wssUrl);
+  }
 
   public start(): void {
     this.stopped = false;
+    if (this.connecting) return;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -196,12 +221,17 @@ export class PoolListener {
       } catch {
         /* ignore */
       }
+      this.ws = null;
     }
 
+    this.connecting = true;
+    console.log(`📡 [HELIUS_WS] Conectando a ${this.safeEndpoint} ...`);
     this.ws = new WebSocket(this.wssUrl);
 
     this.ws.on('open', () => {
+      this.connecting = false;
       this.reconnectAttempt = 0;
+      this.lastErrorWas522 = false;
       console.log(
         '📡 [HELIUS_WS] Conectado — Raydium initialize2 + Pump create (ALT-aware).'
       );
@@ -213,25 +243,51 @@ export class PoolListener {
     });
 
     this.ws.on('error', (err) => {
-      // 522 = Cloudflare/Helius caído; no spamear stack
-      console.error('❌ [HELIUS_WS_ERROR]', err.message);
+      const msg = err.message || String(err);
+      this.lastErrorWas522 = /522|cloudflare|timed out/i.test(msg);
+      console.error(`❌ [HELIUS_WS_ERROR] ${msg} (${this.safeEndpoint})`);
+      if (this.lastErrorWas522) {
+        console.error(
+          '[HELIUS_WS] HTTP 522 = origen Helius no responde. Revisa SOLANA_WSS_URL / API key en dashboard.helius.dev'
+        );
+      }
     });
 
     this.ws.on('close', () => {
+      this.connecting = false;
+      this.ws = null;
       if (this.stopped) return;
-      this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 8);
-      const delayMs = Math.min(60_000, 3_000 * 2 ** (this.reconnectAttempt - 1));
-      console.log(
-        `⚠️ [HELIUS_WS] Cerrado. Reconectando en ${Math.round(delayMs / 1000)}s (intento ${this.reconnectAttempt})...`
-      );
-      this.reconnectTimer = setTimeout(() => this.start(), delayMs);
+      if (this.reconnectTimer) return; // ya programado
+      this.scheduleReconnect();
     });
+  }
+
+  private scheduleReconnect(): void {
+    this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 8);
+    // 522: no martillar; mínimo 15s y sube hasta 2 min
+    const base = this.lastErrorWas522 ? 15_000 : 3_000;
+    const cap = this.lastErrorWas522 ? 120_000 : 60_000;
+    const delayMs = Math.min(cap, base * 2 ** (this.reconnectAttempt - 1));
+    console.log(
+      `⚠️ [HELIUS_WS] Cerrado. Reconectando en ${Math.round(delayMs / 1000)}s (intento ${this.reconnectAttempt})...`
+    );
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.start();
+    }, delayMs);
   }
 
   public stop(): void {
     this.stopped = true;
+    this.connecting = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.ws?.close();
+    this.reconnectTimer = null;
+    try {
+      this.ws?.removeAllListeners();
+      this.ws?.close();
+    } catch {
+      /* ignore */
+    }
     this.ws = null;
   }
 
