@@ -37,11 +37,11 @@ export class BlockZeroScanner {
     deployerAddress: string,
     opts?: AuditTokenOpts
   ): Promise<BlockZeroResult> {
-    const heliosSkip = this.helios.shouldSkipAnalysis(deployerAddress);
-    if (heliosSkip) {
+    // Blacklist solo por rugs confirmados (Helios ya no auto-bloquea en B0)
+    if (this.helios.isBlacklisted(deployerAddress)) {
       return {
         passed: false,
-        reason: heliosSkip.reason,
+        reason: 'Deployer en Blacklist de Helios (rug confirmado)',
         initialMcUSD: 0,
         initialPoolSol: 0,
       };

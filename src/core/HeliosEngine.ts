@@ -68,25 +68,39 @@ export class HeliosEngine {
 
   constructor() {
     this.filePath = path.join(process.cwd(), 'helios_brain.json');
-    const hadSuspicious = this.purgeSuspiciousOnDisk();
+    const purged = this.purgeAutoListsOnDisk();
     this.brain = this.loadBrain();
-    if (hadSuspicious) this.saveBrain();
+    if (purged) this.saveBrain();
   }
 
-  /** Limpia firmas sospechosas del JSON en disco (filtro desactivado). */
-  private purgeSuspiciousOnDisk(): boolean {
+  /**
+   * Limpia listas auto-hinchadas (sospechosos + blacklist de rejects B0).
+   * Blacklist real solo se vuelve a llenar con rugs confirmados.
+   */
+  private purgeAutoListsOnDisk(): boolean {
     try {
       const raw = JSON.parse(fs.readFileSync(this.filePath, 'utf-8')) as HeliosBrainSchema;
-      const list = raw.cabal_patterns?.suspicious_deployer_signatures;
-      if (Array.isArray(list) && list.length > 0) {
+      const sus = raw.cabal_patterns?.suspicious_deployer_signatures;
+      const bl = raw.cabal_patterns?.blacklisted_funding_wallets;
+      let changed = false;
+      if (Array.isArray(sus) && sus.length > 0) {
         raw.cabal_patterns.suspicious_deployer_signatures = [];
-        fs.writeFileSync(this.filePath, JSON.stringify(raw, null, 2));
-        return true;
+        changed = true;
       }
+      if (Array.isArray(bl) && bl.length > 0) {
+        raw.cabal_patterns.blacklisted_funding_wallets = [];
+        changed = true;
+        console.log(
+          `[HELIOS_JSON] Blacklist auto-limpiada (${bl.length} entries). Solo rugs confirmados volverán a entrar.`
+        );
+      }
+      if (changed) {
+        fs.writeFileSync(this.filePath, JSON.stringify(raw, null, 2));
+      }
+      return changed;
     } catch {
-      /* loadBrain lanzará si falta el archivo */
+      return false;
     }
-    return false;
   }
 
   private loadBrain(): HeliosBrainSchema {
@@ -99,7 +113,6 @@ export class HeliosEngine {
       learned_weights: { ...DEFAULT_WEIGHTS, ...raw.learned_weights },
       cabal_patterns: {
         blacklisted_funding_wallets: raw.cabal_patterns?.blacklisted_funding_wallets ?? [],
-        // Lista desactivada: no se usa para skip (se vacía al cargar)
         suspicious_deployer_signatures: [],
       },
       performance_metrics: {
@@ -141,14 +154,8 @@ export class HeliosEngine {
     return this.brain.cabal_patterns.blacklisted_funding_wallets.includes(address);
   }
 
-  /**
-   * Solo blacklist dura. Sin firmas sospechosas (B0/ventana ya filtran bastante).
-   */
-  public shouldSkipAnalysis(deployer: string): { skip: boolean; reason: string } | null {
-    if (!deployer) return null;
-    if (this.isBlacklisted(deployer)) {
-      return { skip: true, reason: 'Helios JSON: deployer en blacklist' };
-    }
+  /** Skip pre-B0 desactivado: pool/MC/mint/ventana bastan. */
+  public shouldSkipAnalysis(_deployer: string): { skip: boolean; reason: string } | null {
     return null;
   }
 
@@ -159,7 +166,6 @@ export class HeliosEngine {
     return mem.windowSeen >= this.weights().serial_deploys_per_2h;
   }
 
-  /** Registrar create visto — memoria local, sin getSignaturesForAddress. */
   public noteSeen(deployer: string): void {
     if (!deployer) return;
     const mem = this.ensureDeployer(deployer);
@@ -171,20 +177,16 @@ export class HeliosEngine {
     this.scheduleSave();
   }
 
+  /**
+   * Memoria de rejects sin auto-blacklist (B0 ya filtra pool/MC/mint).
+   * Blacklist solo vía updateAfterTrade(wasRug=true).
+   */
   public noteReject(deployer: string, reason: string): void {
     if (!deployer) return;
     const mem = this.ensureDeployer(deployer);
     mem.rejects++;
     mem.lastReason = reason.slice(0, 120);
     mem.lastTs = Date.now();
-    const rugish =
-      /blacklist|cabal|mint\/freeze|inseguro|dev vend/i.test(reason);
-    if (rugish && !this.isBlacklisted(deployer)) {
-      this.brain.cabal_patterns.blacklisted_funding_wallets.push(deployer);
-      console.log(`[HELIOS_JSON] Deployer ${deployer} → blacklist (${reason}).`);
-      this.saveBrain();
-      return;
-    }
     this.scheduleSave();
   }
 

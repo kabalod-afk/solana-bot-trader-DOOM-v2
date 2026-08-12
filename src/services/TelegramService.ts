@@ -84,14 +84,20 @@ export class TelegramService {
         parse_mode: 'HTML',
         disable_web_page_preview: true,
       });
-    } catch {
+    } catch (e1) {
+      const msg1 = e1 instanceof Error ? e1.message : String(e1);
+      if (/chat not found|bot was blocked|unauthorized/i.test(msg1)) {
+        console.error(`[TELEGRAM] ${msg1} — revisa TELEGRAM_CHAT_ID y que hayas abierto el bot.`);
+        return;
+      }
       try {
         await this.bot.sendMessage(
           this.chatId,
           plainFallback ?? html.replace(/<[^>]+>/g, '')
         );
       } catch (e2) {
-        console.error('[TELEGRAM_ERROR]', e2);
+        const msg2 = e2 instanceof Error ? e2.message : String(e2);
+        console.error(`[TELEGRAM] ${msg2}`);
       }
     }
   }

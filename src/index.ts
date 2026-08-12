@@ -169,11 +169,6 @@ async function bootstrap(): Promise<void> {
     if (!scheduler.canSpawnThread()) return;
 
     helios.noteSeen(event.deployerAddress);
-    const heliosSkip = helios.shouldSkipAnalysis(event.deployerAddress);
-    if (heliosSkip) {
-      console.log(`[HELIOS_SKIP] ${token}: ${heliosSkip.reason}`);
-      return;
-    }
 
     inflightTokens.add(token);
 
