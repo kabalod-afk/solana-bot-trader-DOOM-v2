@@ -171,6 +171,7 @@ export class PoolListener {
   private stopped = false;
   private seenSignatures = new Set<string>();
   private subId = 1;
+  private reconnectAttempt = 0;
 
   constructor(
     private wssUrl: string,
@@ -200,6 +201,7 @@ export class PoolListener {
     this.ws = new WebSocket(this.wssUrl);
 
     this.ws.on('open', () => {
+      this.reconnectAttempt = 0;
       console.log(
         '📡 [HELIUS_WS] Conectado — Raydium initialize2 + Pump create (ALT-aware).'
       );
@@ -211,13 +213,18 @@ export class PoolListener {
     });
 
     this.ws.on('error', (err) => {
+      // 522 = Cloudflare/Helius caído; no spamear stack
       console.error('❌ [HELIUS_WS_ERROR]', err.message);
     });
 
     this.ws.on('close', () => {
       if (this.stopped) return;
-      console.log('⚠️ [HELIUS_WS] Cerrado. Reconectando en 3s...');
-      this.reconnectTimer = setTimeout(() => this.start(), 3000);
+      this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 8);
+      const delayMs = Math.min(60_000, 3_000 * 2 ** (this.reconnectAttempt - 1));
+      console.log(
+        `⚠️ [HELIUS_WS] Cerrado. Reconectando en ${Math.round(delayMs / 1000)}s (intento ${this.reconnectAttempt})...`
+      );
+      this.reconnectTimer = setTimeout(() => this.start(), delayMs);
     });
   }
 

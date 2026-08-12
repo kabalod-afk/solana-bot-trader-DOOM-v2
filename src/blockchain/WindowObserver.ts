@@ -293,27 +293,27 @@ export class WindowObserver {
 
     for (const line of logBuffer) {
       const lower = line.toLowerCase();
-      if (lower.includes('instruction: buy') || lower.includes('instruction:buy')) {
+      const isIxBuy =
+        lower.includes('instruction: buy') || lower.includes('instruction:buy');
+      const isIxSell =
+        lower.includes('instruction: sell') || lower.includes('instruction:sell');
+
+      if (isIxBuy) {
         buys++;
-      } else if (
-        lower.includes('instruction: sell') ||
-        lower.includes('instruction:sell')
-      ) {
+      } else if (isIxSell) {
         sells++;
         hasThirdPartySell = true;
-      } else if (lower.includes('sell') || lower.includes('swap')) {
-        if (lower.includes('sell') || lower.includes('amount_in')) {
-          sells++;
-          hasThirdPartySell = true;
-        } else {
-          buys++;
-        }
       }
-      if (deployerAddress && line.includes(deployerAddress)) {
-        if (lower.includes('sell') || lower.includes('transfer')) {
-          isDevSelling = true;
-        }
+
+      // Dev sell: solo instrucción Sell explícita + pubkey del deployer (no Transfer de create)
+      if (
+        deployerAddress &&
+        isIxSell &&
+        line.includes(deployerAddress)
+      ) {
+        isDevSelling = true;
       }
+
       const matches = line.match(WALLET_RE);
       if (matches) {
         for (const m of matches) wallets.push(m);
@@ -336,7 +336,11 @@ export class WindowObserver {
     }
 
     const currentPoolSol = await this.readPoolSol(pool, solWatch);
-    const lpDrained = initialPoolSol > 0 && currentPoolSol < initialPoolSol * 0.9;
+    // Evitar falso LP drain si RPC devolvió 0 por timeout
+    const lpDrained =
+      initialPoolSol > 0 &&
+      currentPoolSol > 0.01 &&
+      currentPoolSol < initialPoolSol * 0.9;
     const volumeSolIn = Math.max(0, currentPoolSol - lastPoolSol);
 
     if (buys + sells === 0 && volumeSolIn <= 0) {
