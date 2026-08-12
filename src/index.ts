@@ -130,7 +130,7 @@ async function bootstrap(): Promise<void> {
     `Momentum: pool≥${momentum.minPoolSol} SOL | MC $${momentum.minMcUSD}-$${momentum.maxMcUSD} | minTx=${momentum.minTxCount}`
   );
   console.log(
-    `Helios JSON: ventana≥${hw.min_observation_window_ms}ms buy≥${hw.ideal_buy_ratio} burstLogs=${hw.log_burst_buys} serial/2h=${hw.serial_deploys_per_2h}`
+    `Helios JSON: ventana≥${hw.min_observation_window_ms}ms buy≥${hw.ideal_buy_ratio} burstLogs=${hw.log_burst_buys}`
   );
 
   const flushHelios = () => {

@@ -68,7 +68,25 @@ export class HeliosEngine {
 
   constructor() {
     this.filePath = path.join(process.cwd(), 'helios_brain.json');
+    const hadSuspicious = this.purgeSuspiciousOnDisk();
     this.brain = this.loadBrain();
+    if (hadSuspicious) this.saveBrain();
+  }
+
+  /** Limpia firmas sospechosas del JSON en disco (filtro desactivado). */
+  private purgeSuspiciousOnDisk(): boolean {
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.filePath, 'utf-8')) as HeliosBrainSchema;
+      const list = raw.cabal_patterns?.suspicious_deployer_signatures;
+      if (Array.isArray(list) && list.length > 0) {
+        raw.cabal_patterns.suspicious_deployer_signatures = [];
+        fs.writeFileSync(this.filePath, JSON.stringify(raw, null, 2));
+        return true;
+      }
+    } catch {
+      /* loadBrain lanzará si falta el archivo */
+    }
+    return false;
   }
 
   private loadBrain(): HeliosBrainSchema {
@@ -81,7 +99,8 @@ export class HeliosEngine {
       learned_weights: { ...DEFAULT_WEIGHTS, ...raw.learned_weights },
       cabal_patterns: {
         blacklisted_funding_wallets: raw.cabal_patterns?.blacklisted_funding_wallets ?? [],
-        suspicious_deployer_signatures: raw.cabal_patterns?.suspicious_deployer_signatures ?? [],
+        // Lista desactivada: no se usa para skip (se vacía al cargar)
+        suspicious_deployer_signatures: [],
       },
       performance_metrics: {
         total_trades: raw.performance_metrics?.total_trades ?? 0,
@@ -122,35 +141,13 @@ export class HeliosEngine {
     return this.brain.cabal_patterns.blacklisted_funding_wallets.includes(address);
   }
 
-  public isSuspiciousDeployer(address: string): boolean {
-    return this.brain.cabal_patterns.suspicious_deployer_signatures.includes(address);
-  }
-
   /**
-   * Decisión local (JSON) antes de RPC: blacklist, sospechoso, serial cabal, racha de rejects.
+   * Solo blacklist dura. Sin firmas sospechosas (B0/ventana ya filtran bastante).
    */
   public shouldSkipAnalysis(deployer: string): { skip: boolean; reason: string } | null {
     if (!deployer) return null;
     if (this.isBlacklisted(deployer)) {
       return { skip: true, reason: 'Helios JSON: deployer en blacklist' };
-    }
-    if (this.isSuspiciousDeployer(deployer)) {
-      return { skip: true, reason: 'Helios JSON: deployer en firmas sospechosas' };
-    }
-    const mem = this.brain.analysis_memory.deployers[deployer];
-    if (!mem) return null;
-    const w = this.weights();
-    if (mem.rejects >= w.skip_after_rejects) {
-      return {
-        skip: true,
-        reason: `Helios JSON: ${mem.rejects} rejects previos (${mem.lastReason})`,
-      };
-    }
-    if (this.isSerialCabal(deployer)) {
-      return {
-        skip: true,
-        reason: `Helios JSON: cabal serial (${mem.windowSeen} creates / 2h)`,
-      };
     }
     return null;
   }
@@ -170,13 +167,6 @@ export class HeliosEngine {
     mem.lastTs = Date.now();
     this.touchWindow(mem);
     mem.windowSeen++;
-    if (this.isSerialCabal(deployer) && !this.isSuspiciousDeployer(deployer)) {
-      this.brain.cabal_patterns.suspicious_deployer_signatures.push(deployer);
-      console.log(`[HELIOS_JSON] Deployer ${deployer} marcado sospechoso (serial cabal).`);
-      this.pruneLists();
-      this.saveBrain();
-      return;
-    }
     this.pruneDeployers();
     this.scheduleSave();
   }
@@ -187,17 +177,11 @@ export class HeliosEngine {
     mem.rejects++;
     mem.lastReason = reason.slice(0, 120);
     mem.lastTs = Date.now();
-    const w = this.weights();
     const rugish =
       /blacklist|cabal|mint\/freeze|inseguro|dev vend/i.test(reason);
     if (rugish && !this.isBlacklisted(deployer)) {
       this.brain.cabal_patterns.blacklisted_funding_wallets.push(deployer);
       console.log(`[HELIOS_JSON] Deployer ${deployer} → blacklist (${reason}).`);
-      this.saveBrain();
-      return;
-    }
-    if (mem.rejects >= w.skip_after_rejects && !this.isSuspiciousDeployer(deployer)) {
-      this.brain.cabal_patterns.suspicious_deployer_signatures.push(deployer);
       this.saveBrain();
       return;
     }
@@ -288,9 +272,7 @@ export class HeliosEngine {
 
   private pruneLists(): void {
     const cabal = this.brain.cabal_patterns;
-    if (cabal.suspicious_deployer_signatures.length > 400) {
-      cabal.suspicious_deployer_signatures = cabal.suspicious_deployer_signatures.slice(-300);
-    }
+    cabal.suspicious_deployer_signatures = [];
     if (cabal.blacklisted_funding_wallets.length > 400) {
       cabal.blacklisted_funding_wallets = cabal.blacklisted_funding_wallets.slice(-300);
     }

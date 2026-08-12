@@ -172,15 +172,7 @@ export class BlockZeroScanner {
 
     const liveTrading = isLiveTrading();
 
-    // Cabal: JSON primero (serial / sospechoso). RPC solo la 1ª-2ª vez en LIVE.
-    if (this.helios.isSerialCabal(deployerAddress)) {
-      return {
-        passed: false,
-        reason: 'Helios JSON: cluster cabal serial',
-        initialMcUSD,
-        initialPoolSol: poolMetrics.solAmount,
-      };
-    }
+    // Cabal on-chain solo las primeras veces en LIVE (sin lista de firmas sospechosas)
     const mem = this.helios.brain.analysis_memory.deployers[deployerAddress];
     if (liveTrading && (mem?.windowSeen ?? 0) <= 2) {
       if (await this.traceCabalFundingOnChain(deployer)) {
